@@ -14,7 +14,14 @@
          font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; text-align:center; }
   img { width:min(320px, 70vw); height:auto; margin-bottom:28px; }
   h1 { font-size:clamp(2rem, 6vw, 3rem); letter-spacing:-0.02em; }
-  h1 span { box-shadow: inset 0 -0.28em 0 var(--yellow); }
+  @font-face { font-family:"Permanent Marker"; src:url("/fonts/PermanentMarker-Regular.ttf") format("truetype"); font-display:swap; }
+  @font-face { font-family:"Covered By Your Grace"; src:url("/fonts/CoveredByYourGrace.ttf") format("truetype"); font-display:swap; }
+  @font-face { font-family:"Gloria Hallelujah"; src:url("/fonts/GloriaHallelujah.ttf") format("truetype"); font-display:swap; }
+  h1 { font-weight:400; letter-spacing:0; line-height:1.2; }
+  h1 .w1 { font-family:"Permanent Marker", cursive; }
+  h1 .w2 { font-family:"Covered By Your Grace", cursive; font-size:1.18em; }
+  h1 .w3 { font-family:"Gloria Hallelujah", cursive; font-size:0.92em; }
+  h1 .hl { background:linear-gradient(transparent 52%, var(--yellow) 52%, var(--yellow) 72%, transparent 72%); padding:0 .08em; }
   p { color:var(--muted); margin-top:10px; font-size:1.05rem; }
   details { width:min(440px, 100%); margin-top:32px; }
   summary { list-style:none; display:inline-block; cursor:pointer; font-weight:600; color:var(--accent);
@@ -37,7 +44,7 @@
 </head>
 <body>
   <img src="logo.svg" alt="Three stacked totes">
-  <h1>Totes <span>Totes</span> Totes</h1>
+  <h1><span class="w1">Totes</span> <span class="w2 hl">Totes</span> <span class="w3">Totes</span></h1>
   <p>Tote rentals in Southeast Missouri. Coming soon.</p>
   <details id="contact">
   <summary>Contact us</summary>
