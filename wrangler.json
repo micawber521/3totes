@@ -1,0 +1,14 @@
+{
+  "name": "3totes",
+  "compatibility_date": "2025-04-01",
+  "main": "./worker.js",
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": true
+  },
+  "routes": [
+    { "pattern": "3totes.com", "custom_domain": true },
+    { "pattern": "www.3totes.com", "custom_domain": true }
+  ]
+}

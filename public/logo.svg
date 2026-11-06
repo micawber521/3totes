@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 190" role="img" aria-label="Three stacked totes">
+  <defs>
+    <g id="tote">
+      <!-- body: slightly tapered bin -->
+      <path d="M6 20 H104 L97 78 Q96 84 90 84 H20 Q14 84 13 78 Z" fill="#1f8a3b"/>
+      <!-- lid with lip -->
+      <rect x="0" y="8" width="110" height="14" rx="4" fill="#111"/>
+      <!-- handle cutout -->
+      <rect x="40" y="32" width="30" height="8" rx="4" fill="#fafaf7"/>
+      <!-- ribs -->
+      <path d="M30 50 V74 M55 50 V74 M80 50 V74" stroke="#17702f" stroke-width="4" stroke-linecap="round"/>
+    </g>
+  </defs>
+  <use href="#tote" x="5" y="98"/>
+  <use href="#tote" x="125" y="98"/>
+  <use href="#tote" x="65" y="10"/>
+</svg>
