@@ -13,10 +13,9 @@ const STATUS_LABEL = {
   returned: "Returned", closed: "Closed", cancelled: "Cancelled",
 };
 const KIT_STATUSES = ["active", "cleaning", "retired"];
-const KIT_ITEMS = [
-  ["totes", "12 totes with lids"], ["truck", "Hand truck"], ["blankets", "3 moving blankets"],
-  ["hardwood", "8 hardwood sliders"], ["carpet", "8 carpet sliders"], ["lift", "Lifting strap set"], ["cam", "2 cam-buckle straps"],
-];
+// charge for one price-list line: package items are replaced by the whole pack.
+const lineCharge = (it, qty) => qty > 0 ? Math.ceil(qty / Math.max(1, it.pack_size)) * it.price_cents : 0;
+const packNote = (it) => it.pack_size > 1 ? `pack of ${it.pack_size}: any missing = whole pack` : "";
 const SETTING_FIELDS = [
   ["deposit_cents", "Deposit", "money"],
   ["moving_first_cents", "Moving plan, first 2 weeks", "money"],
@@ -43,7 +42,7 @@ const badge = (s) => `<span class="badge s-${esc(s)}">${esc(STATUS_LABEL[s] || s
 
 function page(title, who, body, flash = "") {
   const nav = who.role === "owner"
-    ? `<a href="/admin">Schedule</a><a href="/admin/bookings">Bookings</a><a href="/admin/bookings/new">New booking</a><a href="/admin/kits">Kits</a><a href="/admin/zones">Zones</a><a href="/admin/settings">Settings</a>`
+    ? `<a href="/admin">Schedule</a><a href="/admin/bookings">Bookings</a><a href="/admin/bookings/new">New booking</a><a href="/admin/kits">Kits</a><a href="/admin/zones">Zones</a><a href="/admin/prices">Price list</a><a href="/admin/settings">Settings</a>`
     : `<a href="/admin">Schedule</a>`;
   return new Response(`<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex">
@@ -91,6 +90,7 @@ export async function handleAdmin(request, env) {
   if (m && request.method === "POST") return bookingUpdate(db, who, Number(m[1]), request, env);
   if (path === "/admin/kits") return request.method === "POST" ? kitsPost(db, request) : kitsPage(db, who, flash);
   if (path === "/admin/settings") return request.method === "POST" ? settingsPost(db, request) : settingsPage(db, who, flash, url, env);
+  if (path === "/admin/prices") return request.method === "POST" ? pricesPost(db, request) : pricesPage(db, who, flash);
   if (path === "/admin/zones") return request.method === "POST" ? zonesPost(db, request) : zonesPage(db, who, flash);
   return deny(404, "Not found");
 }
@@ -256,15 +256,22 @@ async function bookingView(db, who, id, flash, error = "") {
   const sAll = await getSettings(db);
   const rrToday = rentalRefundInfo({ ...b, pickup_date: t }, pays);
   const canComplete = ["delivered", "pickup_requested"].includes(b.status);
+  const priceItems = canComplete ? (await db.prepare("SELECT * FROM price_items WHERE active = 1 ORDER BY sort, name").all()).results : [];
+  const handling = priceItems.find((i) => i.kind === "handling");
   const complete = canComplete ? `<section class="card complete"><h2>Complete pickup</h2>
       <p class="muted">Do this onsite once everything is loaded. It marks the kit returned${b.paypal_subscription_id ? ", stops PayPal billing" : ""} and refunds the deposit.</p>
       <form method="post" class="grid narrow" onsubmit="return confirm('Complete pickup and issue the refund now?')">
         <input type="hidden" name="action" value="complete_pickup">
-        <fieldset><legend>Everything back?</legend>${KIT_ITEMS.map(([k, label]) => `<label class="check"><input type="checkbox" name="item_${k}" checked> ${esc(label)}</label>`).join("")}</fieldset>
-        <label>Keep from deposit <input name="kept" inputmode="decimal" value="0.00"></label>
-        <label>Reason <small>(required if keeping anything; the customer sees this)</small> <input name="reason" maxlength="300" placeholder="e.g. 1 cracked tote lid"></label>
+        <fieldset><legend>Count everything. Enter only what's missing or damaged.</legend>
+          ${priceItems.filter((i) => i.kind === "item").map((i) => `<label class="qty"><span>${esc(i.name)} <small>${i.kit_qty ? `kit has ${i.kit_qty}` : ""}${packNote(i) ? ` · ${esc(packNote(i))}` : ""} · ${money(i.price_cents)}${i.pack_size > 1 ? "/pack" : ""}</small></span>
+            <input name="q_${esc(i.key)}" type="number" min="0" max="${i.kit_qty || 99}" value="0" inputmode="numeric"></label>`).join("")}
+          ${priceItems.filter((i) => i.kind === "cleaning").map((i) => `<label class="check"><input type="checkbox" name="q_${esc(i.key)}" value="1"> ${esc(i.name)}: ${money(i.price_cents)}</label>`).join("")}
+          ${handling ? `<small class="muted">${esc(handling.name)} (${money(handling.price_cents)}) is added automatically if anything has to be replaced.</small>` : ""}
+        </fieldset>
+        <label>Other charge <small>(optional)</small> <input name="extra" inputmode="decimal" value="0.00"></label>
+        <label>Other charge reason <small>(required with an other charge; the customer sees it)</small> <input name="extra_reason" maxlength="200"></label>
         ${b.plan === "storage" && rrToday && rrToday.suggest > 0 ? `<label class="check"><input type="checkbox" name="refund_weeks" checked> Also refund unused storage weeks: ${money(rrToday.suggest)}</label><small class="muted">${esc(rrToday.note)}</small>` : ""}
-        <p>Deposit refund: <b>${money(b.deposit_cents - b.deposit_refunded_cents)}</b> minus anything kept.</p>
+        <p>Deposit refund: <b>${money(b.deposit_cents - b.deposit_refunded_cents)}</b> minus any charges. Charges above the deposit are recorded as owed.</p>
         <button type="submit">Complete pickup &amp; refund</button>
       </form></section>` : "";
   const billing = online ? `<section class="card"><h2>PayPal</h2>
@@ -292,7 +299,7 @@ async function bookingView(db, who, id, flash, error = "") {
         <dt>Pickup</dt><dd>${b.pickup_date ? esc(niceDate(b.pickup_date)) : "Open-ended"}</dd>
         <dt>Est. return</dt><dd>${b.est_return_date ? esc(niceDate(b.est_return_date)) + " <small>(customer estimate)</small>" : "<span class='muted'>none</span>"}</dd>
         <dt>Customer link</dt><dd>${b.manage_token ? `<input readonly value="https://3totes.com/my/${esc(b.manage_token)}" onclick="this.select()"><br><small>Their page to schedule pickup. Send it to manual-booking customers.</small>` : ""}</dd>
-        <dt>Deposit</dt><dd>${money(b.deposit_cents)}${b.deposit_refunded_cents ? `, refunded ${money(b.deposit_refunded_cents)}` : ""}${b.deposit_kept_cents ? `, kept ${money(b.deposit_kept_cents)} (${esc(b.deposit_kept_reason || "")})` : ""}</dd>
+        <dt>Deposit</dt><dd>${money(b.deposit_cents)}${b.deposit_refunded_cents ? `, refunded ${money(b.deposit_refunded_cents)}` : ""}${b.deposit_kept_cents ? `, kept ${money(b.deposit_kept_cents)} (${esc(b.deposit_kept_reason || "")})` : ""}${b.balance_owed_cents ? `<br><b class="owed">Owed beyond deposit: ${money(b.balance_owed_cents)}</b> <small>(send a PayPal invoice)</small>` : ""}</dd>
         <dt>Agreement</dt><dd>${b.signed_at ? `Signed by ${esc(b.signed_name)} at ${esc(b.signed_at)}` : `Not signed online (${esc(b.agreement_version || "no version")})`}</dd>
         <dt>Source</dt><dd>${esc(b.source)}, created ${esc(b.created_at)} UTC</dd>
       </dl></section>
@@ -538,13 +545,28 @@ function rentalRefundInfo(b, pays) {
 async function completePickup(db, who, b, v, env) {
   const back = (msg) => redirect(`/admin/bookings/${b.id}?msg=${encodeURIComponent(msg)}`);
   if (!["delivered", "pickup_requested"].includes(b.status)) return back("This booking isn't out right now.");
-  const kept = toCents(v.kept || "0");
-  const reason = (v.reason || "").trim();
   const left = b.deposit_cents - b.deposit_refunded_cents;
-  if (kept === null) return back("Keep amount must be a dollar amount.");
-  if (kept > left) return back(`You can keep at most the ${money(left)} deposit left.`);
-  if (kept > 0 && !reason) return back("Add a reason for keeping part of the deposit (the customer sees it).");
-  const missing = KIT_ITEMS.filter(([k]) => v[`item_${k}`] !== "on").map(([, label]) => label);
+  const items = (await db.prepare("SELECT * FROM price_items WHERE active = 1 ORDER BY sort, name").all()).results;
+  const charges = [];
+  for (const it of items.filter((i) => i.kind !== "handling")) {
+    const raw = String(v[`q_${it.key}`] ?? "0").trim() || "0";
+    const qty = Number(raw);
+    if (!Number.isInteger(qty) || qty < 0 || qty > 99) return back(`${it.name}: enter a whole number.`);
+    if (qty > 0) charges.push({ name: it.name, qty: it.kind === "cleaning" ? 1 : qty, cents: it.kind === "cleaning" ? it.price_cents : lineCharge(it, qty), kind: it.kind, pack: it.pack_size });
+  }
+  const hand = items.find((i) => i.kind === "handling");
+  if (hand && charges.some((c) => c.kind === "item")) charges.push({ name: hand.name, qty: 1, cents: hand.price_cents, kind: "handling", pack: 1 });
+  const extra = toCents(v.extra || "0");
+  const extraReason = (v.extra_reason || "").trim();
+  if (extra === null) return back("Other charge must be a dollar amount.");
+  if (extra > 0 && !extraReason) return back("Add a reason for the other charge (the customer sees it).");
+  if (extra > 0) charges.push({ name: extraReason, qty: 1, cents: extra, kind: "other", pack: 1 });
+  const total = charges.reduce((a, c) => a + c.cents, 0);
+  const kept = Math.min(total, left);
+  const owed = total - kept;
+  const describe = (c) => c.kind === "item" ? `${c.qty} × ${c.name}${c.pack > 1 ? ` (pack of ${c.pack})` : ""}: ${money(c.cents)}` : `${c.name}: ${money(c.cents)}`;
+  const reason = charges.map(describe).join("; ");
+  const missing = charges.filter((c) => c.kind === "item").map((c) => `${c.qty} × ${c.name}`);
   const t = today();
   const pays = (await db.prepare("SELECT * FROM payments WHERE booking_id = ? ORDER BY id").bind(b.id).all()).results;
   const online = Boolean(b.paypal_subscription_id);
@@ -598,17 +620,17 @@ async function completePickup(db, who, b, v, env) {
   const settled = !problems.some((p) => p.includes("deposit"));
   await db.prepare(
     `UPDATE bookings SET status = 'returned', pickup_date = ?, returned_at = datetime('now'), deposit_kept_cents = deposit_kept_cents + ?,
-       deposit_kept_reason = COALESCE(NULLIF(?, ''), deposit_kept_reason),
+       deposit_kept_reason = COALESCE(NULLIF(?, ''), deposit_kept_reason), balance_owed_cents = balance_owed_cents + ?,
        deposit_settled_at = CASE WHEN ? THEN datetime('now') ELSE deposit_settled_at END,
-       updated_at = datetime('now') WHERE id = ?`).bind(t, kept, reason, settled ? 1 : 0, b.id).run();
+       updated_at = datetime('now') WHERE id = ?`).bind(t, kept, reason, owed, settled ? 1 : 0, b.id).run();
   await logEvent(db, b.id, who, "pickup completed",
-    [missing.length ? `MISSING: ${missing.join(", ")}` : "all items back", kept ? `kept ${money(kept)}: ${reason}` : "", ...notes, ...problems]
+    [charges.length ? `CHARGES ${money(total)}: ${reason}` : "everything back, no charges", owed ? `OWED beyond deposit: ${money(owed)}` : "", ...notes, ...problems]
       .filter(Boolean).join("; "));
-  if (settled) await refundEmail(db, env, b.id, { depositRefund, kept, reason, weeksRefund, missing, pickedUp: true });
+  if (settled) await refundEmail(db, env, b.id, { depositRefund, kept, weeksRefund, charges: charges.map(describe), owed, pickedUp: true });
   return back(problems.length ? `Pickup completed, but: ${problems.join("; ")}.` : `Pickup completed: ${notes.join(", ")}. Customer emailed.`);
 }
 
-async function refundEmail(db, env, id, { depositRefund = 0, kept = 0, reason = "", weeksRefund = 0, missing = [], pickedUp = false }) {
+async function refundEmail(db, env, id, { depositRefund = 0, kept = 0, reason = "", weeksRefund = 0, charges = [], owed = 0, pickedUp = false }) {
   const b = await db.prepare("SELECT b.*, c.name, c.email FROM bookings b JOIN customers c ON c.id = b.customer_id WHERE b.id = ?").bind(id).first();
   if (!b || !b.email) return;
   const owner = String(env.CONTACT_EMAIL || "").trim();
@@ -616,10 +638,11 @@ async function refundEmail(db, env, id, { depositRefund = 0, kept = 0, reason = 
     `Hi ${b.name},`, "",
     pickedUp ? "We picked up your totes today. Thanks for renting with us!" : "Here's an update on your deposit.", "",
     `Deposit: ${money(b.deposit_cents)}`,
-    ...(kept ? [`Kept: ${money(kept)}${reason ? ` for ${reason}` : ""}`] : []),
+    ...(charges.length ? ["", "Charges (from our price list at 3totes.com/prices):", ...charges.map((c) => `  - ${c}`), ""] : []),
+    ...(kept ? [`Kept from deposit: ${money(kept)}${reason && !charges.length ? ` for ${reason}` : ""}`] : []),
     `Refunded: ${money(depositRefund)}`,
     ...(weeksRefund ? [`Unused storage weeks refunded: ${money(weeksRefund)}`] : []),
-    ...(missing.length ? ["", `Items we didn't get back: ${missing.join(", ")}. Please reply to this email if you still have them.`] : []),
+    ...(owed ? ["", `Remaining balance: ${money(owed)} (charges above your deposit). We'll send you an invoice.`] : []),
     "",
     b.paypal_subscription_id
       ? "Refunds go back to the payment method you used through PayPal. Your bank may take a few business days to show it."
@@ -631,6 +654,52 @@ async function refundEmail(db, env, id, { depositRefund = 0, kept = 0, reason = 
     to: b.email, subject: pickedUp ? "Pickup complete: your deposit refund" : "Your deposit refund", text: lines.join("\n"),
     replyTo: owner ? `<${owner}>` : undefined,
   });
+}
+
+// ---------- price list ----------
+
+async function pricesPage(db, who, flash) {
+  const items = (await db.prepare("SELECT * FROM price_items ORDER BY active DESC, sort, name").all()).results;
+  const row = (i) => `<tr${i.active ? "" : ' class="muted"'}>
+      <td><input form="p-${esc(i.key)}" name="name" value="${esc(i.name)}" maxlength="80" required></td>
+      <td>${esc({ item: "Kit item", cleaning: "Cleaning", handling: "Replacement trip" }[i.kind])}</td>
+      <td>${i.kind === "item" ? `<input form="p-${esc(i.key)}" name="kit_qty" type="number" min="0" max="99" value="${i.kit_qty ?? ""}" style="width:70px">` : ""}</td>
+      <td>${i.kind === "item" ? `<input form="p-${esc(i.key)}" name="pack_size" type="number" min="1" max="99" value="${i.pack_size}" style="width:70px">` : ""}</td>
+      <td><input form="p-${esc(i.key)}" name="price" inputmode="decimal" value="${(i.price_cents / 100).toFixed(2)}" style="width:90px"></td>
+      <td><input form="p-${esc(i.key)}" name="note" value="${esc(i.note || "")}" maxlength="200"></td>
+      <td><select form="p-${esc(i.key)}" name="active"><option value="1"${i.active ? " selected" : ""}>Shown</option><option value="0"${i.active ? "" : " selected"}>Hidden</option></select></td>
+      <td><form method="post" id="p-${esc(i.key)}"><input type="hidden" name="action" value="save"><input type="hidden" name="key" value="${esc(i.key)}"><button>Save</button></form></td></tr>`;
+  return page("Price list", who, `
+    <p class="muted">Replacement charges used at Complete pickup and shown publicly at <a href="/prices" target="_blank">3totes.com/prices</a>.
+      Pack size above 1 means any missing piece is charged as a whole pack. The replacement trip is added once whenever something has to be replaced.</p>
+    <table><thead><tr><th>Item</th><th>Type</th><th>Kit has</th><th>Pack size</th><th>Price</th><th>Note (public)</th><th></th><th></th></tr></thead>
+      <tbody>${items.map(row).join("")}</tbody></table>
+    <h2>Add an item</h2>
+    <form method="post" class="inline"><input type="hidden" name="action" value="add">
+      <input name="name" placeholder="Item name" required maxlength="80"><input name="kit_qty" type="number" min="0" placeholder="Kit has" style="width:90px">
+      <input name="pack_size" type="number" min="1" value="1" style="width:80px" title="Pack size"><input name="price" placeholder="Price $" inputmode="decimal" style="width:90px" required>
+      <button>Add</button></form>`, flash);
+}
+
+async function pricesPost(db, request) {
+  const v = await readForm(request);
+  const back = (m) => redirect("/admin/prices?msg=" + encodeURIComponent(m));
+  const price = toCents(v.price || "");
+  if (price === null) return back("Price must be a dollar amount.");
+  const pack = Math.max(1, Math.min(99, parseInt(v.pack_size || "1", 10) || 1));
+  const kitQty = v.kit_qty === "" || v.kit_qty === undefined ? null : Math.max(0, Math.min(99, parseInt(v.kit_qty, 10) || 0));
+  if (!v.name) return back("Give the item a name.");
+  if (v.action === "add") {
+    const key = v.name.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "").slice(0, 30) || "item";
+    const r = await db.prepare(`INSERT OR IGNORE INTO price_items (key, name, kind, kit_qty, pack_size, price_cents, sort)
+      VALUES (?, ?, 'item', ?, ?, ?, (SELECT COALESCE(MAX(sort), 0) + 1 FROM price_items WHERE kind = 'item'))`)
+      .bind(key, v.name.slice(0, 80), kitQty, pack, price).run();
+    return back(r.meta.changes ? `Added ${v.name}.` : "An item with that name already exists.");
+  }
+  await db.prepare(`UPDATE price_items SET name = ?, price_cents = ?, note = NULLIF(?, ''), active = ?,
+      kit_qty = CASE WHEN kind = 'item' THEN ? ELSE kit_qty END, pack_size = CASE WHEN kind = 'item' THEN ? ELSE pack_size END WHERE key = ?`)
+    .bind(v.name.slice(0, 80), price, (v.note || "").slice(0, 200), v.active === "0" ? 0 : 1, kitQty, pack, v.key || "").run();
+  return back(`Saved ${v.name}.`);
 }
 
 // ---------- zones ----------
@@ -693,7 +762,7 @@ textarea{min-height:80px}button,.button{font:inherit;font-weight:600;padding:8px
 form.filters,form.inline{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px}form.filters input{flex:1;min-width:200px}form.filters select,form.inline input{width:auto}
 .cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px}.card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:4px 16px 16px}
 dl{display:grid;grid-template-columns:max-content 1fr;gap:6px 14px;margin:0}dt{color:var(--muted)}dd{margin:0}
-label.check{display:flex;gap:8px;align-items:center}label.check input{width:auto}.card.complete{border:2px solid var(--yellow)}
+label.check{display:flex;gap:8px;align-items:center}label.qty{display:flex;gap:10px;align-items:center;justify-content:space-between}label.qty input{width:80px}.owed{color:var(--red)}label.check input{width:auto}.card.complete{border:2px solid var(--yellow)}
 .events{list-style:none;padding:0}.events li{padding:6px 0;border-bottom:1px solid var(--line)}.events time{font-size:.8rem;color:var(--muted)}
 @media (min-width:900px){form.grid:not(.narrow){grid-template-columns:repeat(3,1fr);align-items:start}form.grid:not(.narrow)>button{grid-column:1/-1;justify-self:start}}
 @media (max-width:700px){table,thead,tbody,tr,td{display:block}thead{display:none}tr{border-bottom:2px solid var(--line)}td{border:0;padding:4px 10px}}

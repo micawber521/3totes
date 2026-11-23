@@ -54,6 +54,7 @@ export async function handleBook(request, env) {
   const s = await getSettings(env.DB);
 
   if (p === "/book" && request.method === "GET") return access(s, url) ? bookPage(env, s, url) : comingSoon();
+  if (p === "/prices" && request.method === "GET") return pricesPage(env.DB);
   const my = p.match(/^\/my\/([0-9a-f]{48})$/);
   if (my && request.method === "GET") return myPage(env, s, my[1], url);
   const myApi = p.match(/^\/api\/my\/([0-9a-f]{48})\/(pickup|estimate|cancel_pickup|cancel_booking)$/);
@@ -433,6 +434,22 @@ async function myAction(request, env, s, token, action) {
   return json(200, { ok: true, msg: `Pickup scheduled for ${niceDate(date)}. We sent you a confirmation email.` });
 }
 
+// ---------- public price list (/prices) ----------
+
+async function pricesPage(db) {
+  const items = (await db.prepare("SELECT * FROM price_items WHERE active = 1 ORDER BY sort, name").all()).results;
+  const rows = items.map((i) => `<tr><td><b>${esc(i.name)}</b>${i.note ? `<br><small>${esc(i.note)}</small>` : ""}</td>
+    <td class="num">${money(i.price_cents)}${i.pack_size > 1 ? ` per pack of ${i.pack_size}<br><small>Any missing or damaged piece means the whole pack is replaced.</small>` : i.kind === "item" ? " each" : ""}</td></tr>`).join("");
+  return new Response(`${PAGE_HEAD("Replacement prices | Totes Totes Totes")}<main class="narrow">
+  <a href="/" class="home"><img src="/logo.svg" alt="Totes Totes Totes" class="logo small"></a>
+  <h1 class="marker">Replacement prices</h1>
+  <p class="lede">If something in your kit comes back missing, damaged or overly dirty, these charges come out of your deposit at pickup. Normal wear like light scuffs is fine.</p>
+  <div class="card"><table class="prices">${rows}</table></div>
+  <p class="muted">Prices may change without notice. Charges above the deposit are billed separately.</p>
+  <p class="muted center-text"><a href="/book">Book your totes</a> · <a href="/#contact">Contact us</a></p>
+</main></body></html>`, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
+}
+
 // ---------- pages ----------
 
 const PAGE_HEAD = (title) => `<!doctype html><html lang="en"><head><meta charset="utf-8">
@@ -496,6 +513,7 @@ ${preview ? `<div class="banner">PREVIEW: online booking is OFF. Payments use th
 
   <section class="card" id="s-sign" hidden><h2><span>5</span> Rental agreement</h2>
     <div class="agreement" tabindex="0">${esc(agreement).replace(/\n/g, "<br>")}</div>
+    <p class="muted">Replacement charges for missing or damaged items: <a href="/prices" target="_blank" rel="noopener">see the price list</a>.</p>
     <label class="choice"><input type="checkbox" id="agree"> I have read and agree to the rental agreement.</label>
     <label>Type your full name to sign <input id="signed" maxlength="100" autocomplete="name"></label>
   </section>
@@ -655,6 +673,6 @@ textarea{min-height:80px}button{font:inherit;font-weight:600;padding:10px 16px;b
 .cal button.sel{background:var(--yellow)}.cal span.off{color:#bbb;text-decoration:line-through}.cal span.past{color:#ddd}
 .agreement{max-height:260px;overflow:auto;border:1px solid var(--line);border-radius:8px;padding:12px;font-size:.9rem;background:#fcfcfa}
 ul.sum{padding-left:20px}#paypal{margin-top:12px}
-.big{font-size:1.15rem}.center-text{text-align:center;margin-top:24px}.row input{flex:1}
+.big{font-size:1.15rem}table.prices{width:100%;border-collapse:collapse}table.prices td{padding:10px 4px;border-bottom:1px solid var(--line);vertical-align:top}table.prices td.num{text-align:right;white-space:nowrap}.center-text{text-align:center;margin-top:24px}.row input{flex:1}
 button.link{background:none;padding:0;color:#0b57d0;text-decoration:underline;font-weight:400}
 `;

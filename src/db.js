@@ -122,6 +122,32 @@ const MIGRATIONS = [
        ('cancel_fee_late_cents', '2500'),
        ('cancel_cutoff_days', '5')`,
   ]],
+  [7, [
+    // Damage / replacement price list (policy 2026-11-23). charge = ceil(qty / pack_size) x price:
+    // package items are replaced by the whole pack. 'handling' is added once when any item is replaced.
+    `CREATE TABLE IF NOT EXISTS price_items (
+       key TEXT PRIMARY KEY,
+       name TEXT NOT NULL,
+       kind TEXT NOT NULL DEFAULT 'item' CHECK (kind IN ('item','cleaning','handling')),
+       kit_qty INTEGER,
+       pack_size INTEGER NOT NULL DEFAULT 1,
+       price_cents INTEGER NOT NULL,
+       note TEXT,
+       sort INTEGER NOT NULL DEFAULT 0,
+       active INTEGER NOT NULL DEFAULT 1
+     )`,
+    `INSERT OR IGNORE INTO price_items (key, name, kind, kit_qty, pack_size, price_cents, note, sort) VALUES
+       ('tote', 'Tote with lid', 'item', 12, 1, 1255, 'Cracked, broken or missing tote or lid', 10),
+       ('truck', 'Hand truck', 'item', 1, 1, 5999, 'Any damage, including a bad tire, means a full replacement (wheels are not replaced separately)', 20),
+       ('blanket', 'Moving blanket', 'item', 3, 1, 379, NULL, 30),
+       ('hardwood', 'Hardwood floor sliders', 'item', 8, 8, 479, NULL, 40),
+       ('carpet', 'Carpet sliders', 'item', 8, 8, 479, NULL, 50),
+       ('lift', 'Lifting strap set', 'item', 1, 1, 1399, NULL, 60),
+       ('cam', 'Cam-buckle load straps', 'item', 2, 4, 999, NULL, 70),
+       ('cleaning', 'Cleaning (overly dirty totes)', 'cleaning', NULL, 1, 2000, 'Assessed at pickup', 80),
+       ('handling', 'Replacement trip', 'handling', NULL, 1, 1500, 'Added once when any item has to be replaced (store trip and restocking)', 90)`,
+    `ALTER TABLE bookings ADD COLUMN balance_owed_cents INTEGER NOT NULL DEFAULT 0`,  // charges beyond the deposit
+  ]],
 ];
 
 let ready = false;
