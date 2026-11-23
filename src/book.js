@@ -702,19 +702,31 @@ $("addons").addEventListener("change", () => { loadDates(); summary(); });
 function summary() {
   if (!st.date) { $("summary").innerHTML = ""; return; }
   const moving = st.plan === "moving", packs = Number($("addons").value) || 0, a = st.addon || { first: 0, recurring: 0, packSize: 4 };
-  const first = (moving ? C.movingFirst : C.storageMonthly) + packs * a.first, recurring = (moving ? C.movingWeekly : C.storageMonthly) + packs * a.recurring;
+  const period = moving ? "first 2 weeks" : "first month";
+  const kitFirst = moving ? C.movingFirst : C.storageMonthly, kitNext = moving ? C.movingWeekly : C.storageMonthly;
   const ren = new Date(st.date + "T12:00:00Z"); if (moving) ren.setUTCDate(ren.getUTCDate() + 14); else ren.setUTCMonth(ren.getUTCMonth() + 1);
   const renDate = ren.toISOString().slice(0, 10);
-  const dep = C.deposit + packs * C.depositPerPack;
-  $("summary").innerHTML = "<ul class='sum'><li><b>Today: " + money(dep + first + st.fee) + "</b><ul>" +
-    "<li>" + money(dep) + " refundable deposit (back at pickup)" + (packs && C.depositPerPack ? ", includes " + money(packs * C.depositPerPack) + " for extra totes" : "") + "</li>" +
-    "<li>" + money(first) + (moving ? " first 2 weeks (2-week minimum)" : " first month (1-month minimum)") + (packs ? ", including " + packs * a.packSize + " extra totes" : "") + "</li>" +
-    (st.fee ? "<li>" + money(st.fee) + " delivery</li>" : "") + "</ul></li>" +
+  const depKit = C.deposit, depPacks = packs * C.depositPerPack, dep = depKit + depPacks;
+  const totes = packs * a.packSize;
+  const line = (label, amt, note) => "<tr><td>" + label + (note ? "<br><small>" + note + "</small>" : "") + "</td><td class='amt'>" + money(amt) + "</td></tr>";
+  const rows = [
+    line("Kit rental, " + period, kitFirst, moving ? "2-week minimum" : "1-month minimum"),
+    packs ? line(totes + " extra totes, " + period, packs * a.first) : "",
+    st.fee ? line("Delivery", st.fee) : "",
+    line("Refundable deposit", dep, (depPacks ? money(depKit) + " kit + " + money(depPacks) + " extra totes. " : "") + "You get this back at pickup after a quick check."),
+  ].join("");
+  const nextAmt = kitNext + packs * a.recurring;
+  $("summary").innerHTML =
+    "<h3 class='sumh'>Due today</h3><table class='bill'>" + rows +
+    "<tr class='total'><td>Total today</td><td class='amt'>" + money(dep + kitFirst + packs * a.first + st.fee) + "</td></tr></table>" +
+    "<h3 class='sumh'>Only if you keep it longer</h3>" +
+    "<p>Starting " + nice(renDate) + ": <b>" + money(nextAmt) + (moving ? " per week" : " per month") + "</b>" +
+    (packs ? " <small>(" + money(kitNext) + " kit + " + money(packs * a.recurring) + " extra totes)</small>" : "") +
+    ", charged automatically until " + (st.ful === "self" ? "you return it" : "we pick it up") + ".</p>" +
+    "<h3 class='sumh'>Good to know</h3><ul class='sum'>" +
     "<li>Your rental time starts " + (st.ful === "self" ? "when you pick up the kit on " : "when we deliver on ") + nice(st.date) + ".</li>" +
-    "<li>Still have it after " + (moving ? "2 weeks" : "1 month") + "? " + money(recurring) + (moving ? " per week" : " per month") +
-    ", starting " + nice(renDate) + ", until pickup.</li></ul>" +
-    "<p class='muted'>" + (moving ? "Partial weeks aren't refunded." : "After the first month, unused full weeks of your last month are refunded.") +
-    " Cancel before delivery: " + C.cancelText + "</p>";
+    "<li>" + (moving ? "Partial weeks aren't refunded." : "After the first month, unused full weeks of your last month are refunded.") + "</li>" +
+    "<li>Changed your mind? " + C.cancelText + "</li></ul>";
 }
 function form() {
   return { zip: st.zip, fulfillment: st.ful, hub: $("hub").value, addons: Number($("addons").value) || 0, plan: st.plan, date: st.date, est_return: $("est").value, name: $("name").value, phone: $("phone").value, email: $("email").value,
@@ -783,7 +795,7 @@ textarea{min-height:80px}button{font:inherit;font-weight:600;padding:10px 16px;b
 .cal button,.cal span{padding:9px 0;border-radius:8px}.cal button{background:#fff;border:1.5px solid var(--ink)}.cal button:hover{background:#fff4bf}
 .cal button.sel{background:var(--yellow)}.cal span.off{color:#bbb;text-decoration:line-through}.cal span.past{color:#ddd}
 .agreement{max-height:260px;overflow:auto;border:1px solid var(--line);border-radius:8px;padding:12px;font-size:.9rem;background:#fcfcfa}
-ul.sum{padding-left:20px}#paypal{margin-top:12px}
+ul.sum{padding-left:20px;margin:6px 0}.sumh{font-size:.95rem;margin:16px 0 6px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)}.sumh:first-child{margin-top:4px}table.bill{width:100%;border-collapse:collapse}table.bill td{padding:8px 0;border-bottom:1px solid var(--line);vertical-align:top}table.bill td.amt{text-align:right;white-space:nowrap;padding-left:12px}table.bill tr.total td{border-bottom:0;border-top:2px solid var(--ink);font-weight:700;font-size:1.1rem}#paypal{margin-top:12px}
 .big{font-size:1.15rem}.prices .pi{padding:12px 0;border-bottom:1px solid var(--line)}.prices .pi:last-child{border-bottom:0}.pi-top{display:flex;justify-content:space-between;gap:16px;align-items:baseline}.pi-price{white-space:nowrap;font-weight:600}.pi-price small{font-weight:400}.pi-note{margin:4px 0 0;font-size:.88rem;color:var(--muted)}.center-text{text-align:center;margin-top:24px}.row input{flex:1}
 button.link{background:none;padding:0;color:#0b57d0;text-decoration:underline;font-weight:400}
 `;
