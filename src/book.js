@@ -639,7 +639,7 @@ function setFul() {
   $("addr-label").textContent = st.ful === "self" ? "Your address" : "Delivery address";
   $("date-title").textContent = st.ful === "self" ? "Pick the day you'll get the kit" : "Pick your delivery day";
   $("hub-wrap").hidden = st.ful !== "self" || $("hub").options.length < 2;
-  $("date-note").textContent = st.ful === "self" ? "We'll text you the hub address and a time. Keep the totes as long as you need." : "We drop off first thing in the morning. Keep the totes as long as you need.";
+  $("date-note").textContent = st.ful === "self" ? "You'll get the hub address and hours in your confirmation email. Keep the totes as long as you need." : "We drop off first thing in the morning. Keep the totes as long as you need.";
   show("s-plan"); show("s-date"); if (!st.addon) { loadAddons().then(loadDates); } else if (!st.dates.length) loadDates(); summary();
 }
 document.querySelectorAll("input[name=ful]").forEach((r) => r.addEventListener("change", setFul));
