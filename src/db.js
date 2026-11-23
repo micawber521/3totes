@@ -148,6 +148,19 @@ const MIGRATIONS = [
        ('handling', 'Replacement trip', 'handling', NULL, 1, 1500, 'Added once when any item has to be replaced (store trip and restocking)', 90)`,
     `ALTER TABLE bookings ADD COLUMN balance_owed_cents INTEGER NOT NULL DEFAULT 0`,  // charges beyond the deposit
   ]],
+  [8, [
+    `ALTER TABLE bookings ADD COLUMN fulfillment TEXT NOT NULL DEFAULT 'delivery'`,   // 'delivery' | 'self' (customer picks up at our location)
+    `ALTER TABLE bookings ADD COLUMN return_method TEXT`,                              // 'pickup' (we collect) | 'dropoff' (customer returns it)
+    `ALTER TABLE bookings ADD COLUMN pickup_address TEXT`,                             // where we collect, if different (they moved)
+    `ALTER TABLE bookings ADD COLUMN pickup_zip TEXT`,
+    `ALTER TABLE bookings ADD COLUMN addon_packs INTEGER NOT NULL DEFAULT 0`,          // extra totes, packs of 4
+    `INSERT OR IGNORE INTO settings (key, value) VALUES
+       ('spare_totes', '0'),
+       ('addon_moving_first_cents', '1500'),
+       ('addon_moving_weekly_cents', '500'),
+       ('addon_storage_monthly_cents', '2000'),
+       ('pickup_location_text', 'We will text you our Sikeston address and a time.')`,
+  ]],
 ];
 
 let ready = false;
@@ -217,3 +230,16 @@ export function freeKit({ kits, blocks }, start, end) {
 }
 
 export const newToken = () => [...crypto.getRandomValues(new Uint8Array(24))].map((x) => x.toString(16).padStart(2, "0")).join("");
+
+// Extra-tote packs (4 totes each) reserved by bookings overlapping [start, end]; spare stock is setting spare_totes.
+export const ADDON_PACK_SIZE = 4;
+export async function addonPacksAvailable(db, s, start, end, excludeId = 0) {
+  const buf = `+${Number(s.buffer_days) || 0} days`;
+  const row = await db.prepare(
+    `SELECT COALESCE(SUM(addon_packs), 0) AS n FROM bookings
+      WHERE id != ?1 AND status != 'cancelled' AND addon_packs > 0
+        AND NOT (status = 'pending' AND hold_expires_at IS NOT NULL AND hold_expires_at < datetime('now'))
+        AND (pickup_date IS NULL OR date(pickup_date, ?2) >= ?3)
+        AND (?4 IS NULL OR delivery_date <= date(?4, ?2))`).bind(excludeId, buf, start, end).first();
+  return Math.max(0, Math.floor((Number(s.spare_totes) || 0) / ADDON_PACK_SIZE) - row.n);
+}

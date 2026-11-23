@@ -1,7 +1,7 @@
 // /admin: server-rendered pages for Christian (owner) and drivers.
 // Step 1 of BOOKING_DESIGN: kits, manual bookings, schedule, settings. No payments yet.
 import { adminIdentity } from "./access.js";
-import { ensureSchema, getSettings, kitConflict, newToken } from "./db.js";
+import { ensureSchema, getSettings, kitConflict, newToken, addonPacksAvailable, ADDON_PACK_SIZE } from "./db.js";
 import { paypalReady, refundSale, cancelSubscription } from "./paypal.js";
 import { trySend } from "./mail.js";
 import { cancelFee, cancelBooking } from "./cancel.js";
@@ -23,6 +23,11 @@ const SETTING_FIELDS = [
   ["storage_monthly_cents", "Storage plan, monthly", "money"],
   ["buffer_days", "Turnaround days between rentals", "int"],
   ["lead_days", "Days of notice before a delivery (online)", "int"],
+  ["spare_totes", "Spare totes on hand (for extra-tote packs)", "count"],
+  ["addon_moving_first_cents", "Extra totes (pack of 4), moving: first 2 weeks", "money"],
+  ["addon_moving_weekly_cents", "Extra totes (pack of 4), moving: each week after", "money"],
+  ["addon_storage_monthly_cents", "Extra totes (pack of 4), storage: monthly", "money"],
+  ["pickup_location_text", "Customer pickup/drop-off instructions", "longtext"],
   ["cancel_fee_early_cents", "Cancellation fee, early", "money"],
   ["cancel_fee_late_cents", "Cancellation fee, late", "money"],
   ["cancel_cutoff_days", "Early = at least this many days before delivery", "int"],
@@ -119,11 +124,13 @@ async function schedule(db, who, flash) {
   const stop = (b, date, kind) => {
     const late = date && date < t;
     const name = isOwner ? `<a href="/admin/bookings/${b.id}">${esc(b.name)}</a>` : esc(b.name);
-    const map = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(b.address + " " + b.zip)}`;
+    const atUs = (kind === "drop" && b.fulfillment === "self") || (kind === "pick" && b.return_method === "dropoff");
+    const addr = kind === "pick" && b.pickup_address ? b.pickup_address : b.address, zip = kind === "pick" && b.pickup_zip ? b.pickup_zip : b.zip;
+    const map = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(addr + " " + zip)}`;
     return `<tr class="${late ? "late" : date === t ? "today" : ""}">
       <td>${date ? esc(niceDate(date)) : "<em>no date</em>"}${late ? " <b>overdue</b>" : ""}</td>
       <td>${name}<br><small>${esc(b.phone || "")}</small></td>
-      <td><a href="${esc(map)}" target="_blank" rel="noopener">${esc(b.address)}, ${esc(b.zip)}</a>${b.notes ? `<br><small>${esc(b.notes)}</small>` : ""}</td>
+      <td>${atUs ? `<b>${kind === "drop" ? "Customer picks up at our location" : "Customer drops off at our location"}</b>` : `<a href="${esc(map)}" target="_blank" rel="noopener">${esc(addr)}, ${esc(zip)}</a>${kind === "pick" && b.pickup_address ? " <small>(new address)</small>" : ""}`}${b.addon_packs ? `<br><small>+${b.addon_packs * ADDON_PACK_SIZE} extra totes</small>` : ""}${b.notes ? `<br><small>${esc(b.notes)}</small>` : ""}</td>
       <td>${esc(b.kit)}</td><td>${badge(b.status)}</td></tr>`;
   };
   const table = (rows, kind, empty) => rows.length
@@ -185,6 +192,8 @@ async function bookingForm(db, who, v, error) {
         <label>Plan <select name="plan">
           <option value="moving"${plan === "moving" ? " selected" : ""}>Moving: ${money(s.moving_first_cents)} first 2 weeks, then ${money(s.moving_weekly_cents)}/week</option>
           <option value="storage"${plan === "storage" ? " selected" : ""}>Storage: ${money(s.storage_monthly_cents)}/month</option></select></label>
+        <label>Handoff <select name="fulfillment"><option value="delivery">We deliver &amp; pick up</option><option value="self"${v.fulfillment === "self" ? " selected" : ""}>Customer picks up &amp; returns</option></select></label>
+        <label>Extra totes <small>(packs of ${ADDON_PACK_SIZE})</small> <input name="addon_packs" type="number" min="0" max="10" value="${esc(v.addon_packs || "0")}"></label>
         <label>Kit <select name="kit_id">${kits.map((k) => `<option value="${k.id}"${String(k.id) === String(v.kit_id) ? " selected" : ""}>${esc(k.label)}${k.status === "cleaning" ? " (cleaning)" : ""}</option>`).join("")}</select></label>
         <label>Deposit <input name="deposit" inputmode="decimal" value="${esc(v.deposit ?? (Number(s.deposit_cents || 0) / 100).toFixed(2))}"></label>
         <label>Status <select name="status"><option value="confirmed">Confirmed</option><option value="pending"${v.status === "pending" ? " selected" : ""}>Pending</option></select></label>
@@ -217,6 +226,10 @@ async function bookingCreate(db, who, request) {
   if (deposit === null) return fail("Deposit must be a dollar amount.");
   const kit = await db.prepare("SELECT id, label, status FROM kits WHERE id = ?").bind(Number(v.kit_id)).first();
   if (!kit || kit.status === "retired") return fail("Pick a kit.");
+  const packs = Number(v.addon_packs || 0);
+  if (!Number.isInteger(packs) || packs < 0 || packs > 10) return fail("Extra tote packs must be 0-10.");
+  if (packs && packs > await addonPacksAvailable(db, s, v.delivery_date, v.pickup_date || null)) return fail("Not enough spare totes for those dates (check Spare totes in Settings).");
+  const self = v.fulfillment === "self";
 
   const clash = await kitConflict(db, { kitId: kit.id, start: v.delivery_date, end: v.pickup_date || null, bufferDays: s.buffer_days });
   if (clash) return fail(`${kit.label} is already booked by ${clash.name} (#${clash.id}) from ${niceDate(clash.delivery_date)}${clash.pickup_date ? ` to ${niceDate(clash.pickup_date)}` : " (open-ended)"}, plus ${s.buffer_days} turnaround day(s).`);
@@ -231,10 +244,10 @@ async function bookingCreate(db, who, request) {
   const status = v.status === "pending" ? "pending" : "confirmed";
   const b = await db.prepare(
     `INSERT INTO bookings (customer_id, kit_id, plan, status, address, zip, delivery_date, pickup_date, notes, deposit_cents, agreement_version, source,
-       est_return_date, manage_token)
-     VALUES (?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), ?, ?, 'admin', NULLIF(?, ''), ?) RETURNING id`)
+       est_return_date, manage_token, fulfillment, addon_packs, return_method)
+     VALUES (?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), ?, ?, 'admin', NULLIF(?, ''), ?, ?, ?, ?) RETURNING id`)
     .bind(customer.id, kit.id, v.plan, status, v.address, v.zip, v.delivery_date, v.pickup_date || "", v.notes || "", deposit, s.agreement_version || null,
-      v.est_return_date || "", newToken()).first();
+      v.est_return_date || "", newToken(), self ? "self" : "delivery", packs, self ? "dropoff" : "pickup").first();
   await logEvent(db, b.id, who, "created", `${v.plan}, ${kit.label}, delivery ${v.delivery_date}`);
   return redirect(`/admin/bookings/${b.id}?msg=${encodeURIComponent("Booking created.")}`);
 }
@@ -263,8 +276,8 @@ async function bookingView(db, who, id, flash, error = "") {
       <form method="post" class="grid narrow" onsubmit="return confirm('Complete pickup and issue the refund now?')">
         <input type="hidden" name="action" value="complete_pickup">
         <fieldset><legend>Count everything. Enter only what's missing or damaged.</legend>
-          ${priceItems.filter((i) => i.kind === "item").map((i) => `<label class="qty"><span>${esc(i.name)} <small>${i.kit_qty ? `kit has ${i.kit_qty}` : ""}${packNote(i) ? ` · ${esc(packNote(i))}` : ""} · ${money(i.price_cents)}${i.pack_size > 1 ? "/pack" : ""}</small></span>
-            <input name="q_${esc(i.key)}" type="number" min="0" max="${i.kit_qty || 99}" value="0" inputmode="numeric"></label>`).join("")}
+          ${priceItems.filter((i) => i.kind === "item").map((i) => `<label class="qty"><span>${esc(i.name)} <small>${i.kit_qty ? `kit has ${i.kit_qty}${i.key === "tote" && b.addon_packs ? ` + ${b.addon_packs * ADDON_PACK_SIZE} extra` : ""}` : ""}${packNote(i) ? ` · ${esc(packNote(i))}` : ""} · ${money(i.price_cents)}${i.pack_size > 1 ? "/pack" : ""}</small></span>
+            <input name="q_${esc(i.key)}" type="number" min="0" max="${(i.kit_qty || 99) + (i.key === "tote" ? b.addon_packs * ADDON_PACK_SIZE : 0)}" value="0" inputmode="numeric"></label>`).join("")}
           ${priceItems.filter((i) => i.kind === "cleaning").map((i) => `<label class="check"><input type="checkbox" name="q_${esc(i.key)}" value="1"> ${esc(i.name)}: ${money(i.price_cents)}</label>`).join("")}
           ${handling ? `<small class="muted">${esc(handling.name)} (${money(handling.price_cents)}) is added automatically if anything has to be replaced.</small>` : ""}
         </fieldset>
@@ -293,7 +306,8 @@ async function bookingView(db, who, id, flash, error = "") {
         <dt>Status</dt><dd>${badge(b.status)}</dd>
         <dt>Customer</dt><dd>${esc(b.name)}<br>${esc(b.phone || "")}${b.email ? `<br><a href="mailto:${esc(b.email)}">${esc(b.email)}</a>` : ""}</dd>
         <dt>Address</dt><dd>${esc(b.address)}, ${esc(b.zip)}</dd>
-        <dt>Plan</dt><dd>${esc(b.plan)}</dd>
+        <dt>Plan</dt><dd>${esc(b.plan)}${b.addon_packs ? ` + ${b.addon_packs * ADDON_PACK_SIZE} extra totes (${b.addon_packs} pack${b.addon_packs > 1 ? "s" : ""})` : ""}</dd>
+        <dt>Handoff</dt><dd>${b.fulfillment === "self" ? "Customer picks up at our location" : "We deliver"} · return: ${b.return_method === "dropoff" ? "customer drops off" : `we pick up${b.pickup_address ? ` at <b>${esc(b.pickup_address)}, ${esc(b.pickup_zip || "")}</b> (new address)` : ""}`}</dd>
         <dt>Kit</dt><dd>${esc(b.kit)}</dd>
         <dt>Delivery</dt><dd>${esc(niceDate(b.delivery_date))}, first thing in the morning</dd>
         <dt>Pickup</dt><dd>${b.pickup_date ? esc(niceDate(b.pickup_date)) : "Open-ended"}</dd>
@@ -436,7 +450,7 @@ async function settingsPage(db, who, flash, url, env) {
     </section>
     <p class="muted">Prices are DRAFT until Phase 1 decisions are made. Changing them here affects new bookings only.</p>
     <form method="post" class="grid narrow">
-      ${SETTING_FIELDS.map(([key, label, type]) => `<label>${esc(label)} <input name="${key}" ${type === "int" ? 'type="number" min="0" max="30"' : type === "money" ? 'inputmode="decimal"' : 'maxlength="50"'}
+      ${SETTING_FIELDS.map(([key, label, type]) => `<label>${esc(label)} <input name="${key}" ${type === "int" ? 'type="number" min="0" max="30"' : type === "count" ? 'type="number" min="0" max="9999"' : type === "money" ? 'inputmode="decimal"' : type === "longtext" ? 'maxlength="300"' : 'maxlength="50"'}
         value="${esc(type === "money" ? (Number(s[key] || 0) / 100).toFixed(2) : s[key] ?? "")}"></label>`).join("")}
       <button type="submit">Save settings</button></form>
     <h2>Rental agreement text</h2>
@@ -461,7 +475,8 @@ async function settingsPost(db, request) {
     let val = v[key];
     if (type === "money") { const c = toCents(val); if (c === null) return redirect("/admin/settings?msg=" + encodeURIComponent("Prices must be dollar amounts.")); val = String(c); }
     if (type === "int") { const n = Number(val); if (!Number.isInteger(n) || n < 0 || n > 30) return redirect("/admin/settings?msg=" + encodeURIComponent("Day counts must be 0-30.")); val = String(n); }
-    if (type === "text" && !val) continue;
+    if (type === "count") { const n = Number(val); if (!Number.isInteger(n) || n < 0 || n > 9999) return redirect("/admin/settings?msg=" + encodeURIComponent("Counts must be whole numbers.")); val = String(n); }
+    if ((type === "text" || type === "longtext") && !val) continue;
     stmts.push(db.prepare("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value").bind(key, val));
   }
   if (stmts.length) await db.batch(stmts);

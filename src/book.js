@@ -1,7 +1,7 @@
 // Customer online booking (/book) + PayPal webhook.
 // Hidden behind the `online_booking` setting; while off, /book?preview=<booking_preview_key> still works
 // so Christian can test end to end (sandbox).
-import { ensureSchema, getSettings, kitBlocks, freeKit, kitConflict, newToken } from "./db.js";
+import { ensureSchema, getSettings, kitBlocks, freeKit, kitConflict, newToken, addonPacksAvailable, ADDON_PACK_SIZE } from "./db.js";
 import { paypalReady, createRentalSubscription, getSubscription, verifyWebhook, firstRenewalDate } from "./paypal.js";
 import { trySend } from "./mail.js";
 import { cancelFee, customerCanCancel, cancelBooking, cancelPolicyText } from "./cancel.js";
@@ -26,11 +26,19 @@ function access(s, url) {
   return s.online_booking === "on" || (preview && preview === s.booking_preview_key);
 }
 
-function rates(s, plan) {
+function addonRates(s, plan) {
   return plan === "moving"
+    ? { first: Number(s.addon_moving_first_cents), recurring: Number(s.addon_moving_weekly_cents) }
+    : { first: Number(s.addon_storage_monthly_cents), recurring: Number(s.addon_storage_monthly_cents) };
+}
+function rates(s, plan, packs = 0) {
+  const base = plan === "moving"
     ? { first: Number(s.moving_first_cents), recurring: Number(s.moving_weekly_cents) }
     : { first: Number(s.storage_monthly_cents), recurring: Number(s.storage_monthly_cents) };
+  const a = addonRates(s, plan);
+  return { first: base.first + packs * a.first, recurring: base.recurring + packs * a.recurring };
 }
+const isSelf = (b) => b.fulfillment === "self";
 
 async function availableDates(db, s, plan) {
   const lead = Math.max(1, Number(s.lead_days) || 1); // drop-off is first thing in the morning → never same day
@@ -73,6 +81,14 @@ export async function handleBook(request, env) {
     const plan = url.searchParams.get("plan") === "storage" ? "storage" : "moving";
     return json(200, { ok: true, plan, ...(await availableDates(env.DB, s, plan)) });
   }
+  if (p === "/api/book/addons" && request.method === "GET") {
+    const plan = url.searchParams.get("plan") === "storage" ? "storage" : "moving";
+    const date = url.searchParams.get("date") || "";
+    if (!isDate(date)) return json(400, { ok: false, msg: "Pick a day first." });
+    const max = await addonPacksAvailable(env.DB, s, date, addDays(date, WINDOW_DAYS[plan] - 1));
+    const a = addonRates(s, plan);
+    return json(200, { ok: true, max: Math.min(max, 10), packSize: ADDON_PACK_SIZE, first: a.first, recurring: a.recurring });
+  }
   if (p === "/api/book/start" && request.method === "POST") return start(request, env, s, url);
   if (p === "/api/book/approve" && request.method === "POST") return approve(request, env);
   return json(404, { ok: false, msg: "Not found" });
@@ -101,11 +117,14 @@ async function start(request, env, s, url) {
   const b = await request.json().catch(() => null);
   if (!b) return json(400, { ok: false, msg: "Bad request" });
   const v = {};
-  for (const k of ["zip", "plan", "date", "est_return", "name", "phone", "email", "address", "notes", "signed_name"]) v[k] = String(b[k] ?? "").trim();
+  for (const k of ["zip", "plan", "date", "est_return", "name", "phone", "email", "address", "notes", "signed_name", "fulfillment"]) v[k] = String(b[k] ?? "").trim();
+  const self = v.fulfillment === "self";
+  const packs = Number(b.addons || 0);
+  if (!Number.isInteger(packs) || packs < 0 || packs > 10) return json(400, { ok: false, msg: "Pick how many extra tote packs you need." });
 
   if (!/^\d{5}$/.test(v.zip)) return json(400, { ok: false, msg: "Enter a 5-digit zip code." });
-  const zone = await db.prepare("SELECT zone, delivery_fee_cents FROM zones WHERE zip = ?").bind(v.zip).first();
-  if (!zone) return json(400, { ok: false, msg: "Sorry, we don't deliver to that zip code yet." });
+  const zone = self ? { delivery_fee_cents: 0 } : await db.prepare("SELECT zone, delivery_fee_cents FROM zones WHERE zip = ?").bind(v.zip).first();
+  if (!zone) return json(400, { ok: false, msg: "Sorry, we don't deliver to that zip code yet. You can pick the kit up yourself instead." });
   if (!["moving", "storage"].includes(v.plan)) return json(400, { ok: false, msg: "Pick a plan." });
   if (!isDate(v.date)) return json(400, { ok: false, msg: "Pick a delivery day." });
   if (v.est_return && (!isDate(v.est_return) || v.est_return <= v.date || v.est_return > addDays(v.date, 365)))
@@ -119,9 +138,11 @@ async function start(request, env, s, url) {
   const { dates } = await availableDates(db, s, v.plan);
   if (!dates.includes(v.date)) return json(409, { ok: false, msg: "Sorry, that day was just taken. Please pick another day.", refresh: true });
 
-  const r = rates(s, v.plan);
+  const r = rates(s, v.plan, packs);
   const deposit = Number(s.deposit_cents) || 0;
   const windowEnd = addDays(v.date, WINDOW_DAYS[v.plan] - 1);
+  if (packs > 0 && packs > await addonPacksAvailable(db, s, v.date, windowEnd))
+    return json(409, { ok: false, msg: "Sorry, we don't have that many extra totes for those dates. Please pick fewer.", refreshAddons: true });
   const state = await kitBlocks(db, s.buffer_days);
   const kitId = freeKit(state, v.date, windowEnd);
   if (!kitId) return json(409, { ok: false, msg: "Sorry, that day was just taken. Please pick another day.", refresh: true });
@@ -134,10 +155,11 @@ async function start(request, env, s, url) {
   const booking = await db.prepare(
     `INSERT INTO bookings (customer_id, kit_id, plan, status, address, zip, delivery_date, notes, deposit_cents, delivery_fee_cents,
        rate_first_cents, rate_recurring_cents, agreement_version, signed_name, signed_at, signed_ip, source, hold_expires_at,
-       est_return_date, manage_token)
-     VALUES (?, ?, ?, 'pending', ?, ?, ?, NULLIF(?, ''), ?, ?, ?, ?, ?, ?, datetime('now'), ?, 'online', datetime('now', ?), NULLIF(?, ''), ?) RETURNING id`)
+       est_return_date, manage_token, fulfillment, addon_packs, return_method)
+     VALUES (?, ?, ?, 'pending', ?, ?, ?, NULLIF(?, ''), ?, ?, ?, ?, ?, ?, datetime('now'), ?, 'online', datetime('now', ?), NULLIF(?, ''), ?, ?, ?, ?) RETURNING id`)
     .bind(customer.id, kitId, v.plan, v.address, v.zip, v.date, v.notes, deposit, zone.delivery_fee_cents, r.first, r.recurring,
-      s.agreement_version || null, v.signed_name, ip, `+${HOLD_MINUTES} minutes`, v.est_return, newToken()).first();
+      s.agreement_version || null, v.signed_name, ip, `+${HOLD_MINUTES} minutes`, v.est_return, newToken(),
+      self ? "self" : "delivery", packs, self ? "dropoff" : "pickup").first();
 
   // Two customers racing for the same kit: the earlier booking wins.
   const clash = await kitConflict(db, { kitId, start: v.date, end: windowEnd, bufferDays: s.buffer_days, excludeId: booking.id });
@@ -161,7 +183,7 @@ async function start(request, env, s, url) {
     db.prepare("UPDATE bookings SET paypal_plan_id = ?, paypal_subscription_id = ?, billing_status = 'APPROVAL_PENDING' WHERE id = ?")
       .bind(sub.planId, sub.subscriptionId, booking.id),
     db.prepare("INSERT INTO booking_events (booking_id, by_email, action, detail) VALUES (?, ?, 'created', ?)")
-      .bind(booking.id, v.email, `online, ${v.plan}, delivery ${v.date}, agreement signed by ${v.signed_name}`),
+      .bind(booking.id, v.email, `online, ${v.plan}, ${self ? "customer pickup" : "delivery"} ${v.date}${packs ? `, +${packs} tote pack${packs > 1 ? "s" : ""}` : ""}, agreement signed by ${v.signed_name}`),
   ]);
   return json(200, { ok: true, bookingId: booking.id, subscriptionId: sub.subscriptionId });
 }
@@ -203,8 +225,9 @@ async function sendConfirmation(env, id) {
 
 Your tote rental is booked. Booking #${b.id}.
 
-DELIVERY: ${niceDate(b.delivery_date)}, first thing in the morning
-ADDRESS: ${b.address}, ${b.zip}${b.est_return_date ? `\nYOUR ESTIMATED PICKUP: ${niceDate(b.est_return_date)} (just an estimate, change it anytime)` : ""}
+${isSelf(b)
+  ? `PICK UP YOUR KIT: ${niceDate(b.delivery_date)} at our Sikeston location. ${(await getSettings(env.DB)).pickup_location_text || ""}\nWhen you're done, bring it back to us (free).`
+  : `DELIVERY: ${niceDate(b.delivery_date)}, first thing in the morning\nADDRESS: ${b.address}, ${b.zip}`}${b.est_return_date ? `\nYOUR ESTIMATED PICKUP: ${niceDate(b.est_return_date)} (just an estimate, change it anytime)` : ""}
 
 ${planLine}
 Paid today: ${money(b.deposit_cents + b.rate_first_cents + b.delivery_fee_cents)} = ${money(b.deposit_cents)} refundable deposit + ${money(b.rate_first_cents)} ${b.plan === "moving" ? "first 2 weeks" : "first month"}${b.delivery_fee_cents ? ` + ${money(b.delivery_fee_cents)} delivery` : ""}.
@@ -212,12 +235,13 @@ Your rental time starts on delivery day. If you still have the kit after ${b.pla
 
 CANCELLING: ${cancelPolicyText(await getSettings(env.DB))} Cancel from your booking page below.
 
-YOUR KIT: 12 totes with lids, a hand truck, moving blankets, furniture sliders, lifting straps and load straps.
+YOUR KIT: 12 totes with lids${b.addon_packs ? ` + ${b.addon_packs * ADDON_PACK_SIZE} extra totes` : ""}, a hand truck, moving blankets, furniture sliders, lifting straps and load straps.
+Moving? Take the kit with you anywhere in our service area. Leaving the area? Drop it off with us before you go.
 
 YOUR BOOKING PAGE (schedule pickup, update your estimate):
 ${myLink(b)}
 
-When you're done, schedule your pickup on that page. Please have the totes EMPTY and everything together.
+When you're done, schedule your pickup (or drop-off) on that page. Please have the totes EMPTY and everything together.
 We pick up the empty totes and equipment; we don't move your belongings.
 
 Your deposit is refunded at pickup, right after a quick onsite check of the equipment.
@@ -330,9 +354,12 @@ async function myPage(env, s, token, url) {
   const planLine = b.plan === "moving"
     ? `Moving plan: ${money(b.rate_first_cents)} for the first 2 weeks (2-week minimum), then ${money(b.rate_recurring_cents)}/week`
     : `Storage plan: ${money(b.rate_recurring_cents)}/month (1-month minimum)`;
+  const dropoff = b.return_method === "dropoff";
   const pickupBlock = b.pickup_date
-    ? `<p class="big">Pickup: <b>${esc(niceDate(b.pickup_date))}</b></p><p class="muted">Please have all totes <b>empty</b> and everything together by morning. We pick up the empty totes and equipment; we don't move your belongings.</p>`
-    : `<p>No pickup scheduled yet. Pick a day when you're done.</p>`;
+    ? dropoff
+      ? `<p class="big">Drop-off: <b>${esc(niceDate(b.pickup_date))}</b> at our Sikeston location</p><p class="muted">${esc(s.pickup_location_text || "")} Please bring everything back with the totes <b>empty</b>.</p>`
+      : `<p class="big">Pickup: <b>${esc(niceDate(b.pickup_date))}</b><br><small>${esc(b.pickup_address || b.address)}, ${esc(b.pickup_zip || b.zip)}</small></p><p class="muted">Please have all totes <b>empty</b> and everything together by morning. We pick up the empty totes and equipment; we don't move your belongings.</p>`
+    : `<p>Nothing scheduled yet. When you're done, tell us where to pick up the kit, or bring it back to us yourself.</p>`;
   return new Response(`${PAGE_HEAD("Your booking | Totes Totes Totes")}
 <main class="narrow">
   <a href="/" class="home"><img src="/logo.svg" alt="Totes Totes Totes" class="logo small"></a>
@@ -340,7 +367,9 @@ async function myPage(env, s, token, url) {
   ${flash ? `<p class="card ok">${esc(flash)}</p>` : ""}
   <section class="card"><h2>Booking #${b.id}</h2>
     <p>Status: <b>${esc(MY_STATUS[b.status] || b.status)}</b></p>
-    <p>Delivery: ${esc(niceDate(b.delivery_date))}, first thing in the morning<br>${esc(b.address)}, ${esc(b.zip)}</p>
+    ${isSelf(b) ? `<p>You pick up the kit: ${esc(niceDate(b.delivery_date))} at our Sikeston location<br><small>${esc(s.pickup_location_text || "")}</small></p>`
+      : `<p>Delivery: ${esc(niceDate(b.delivery_date))}, first thing in the morning<br>${esc(b.address)}, ${esc(b.zip)}</p>`}
+    ${b.addon_packs ? `<p>Extra totes: ${b.addon_packs * ADDON_PACK_SIZE} (${b.addon_packs} pack${b.addon_packs > 1 ? "s" : ""} of ${ADDON_PACK_SIZE})</p>` : ""}
     ${b.rate_recurring_cents ? `<p class="muted">${esc(planLine)}</p>` : ""}
     <p>Refundable deposit: <b>${money(b.deposit_cents)}</b>${b.deposit_settled_at
       ? `<br>Refunded ${money(b.deposit_refunded_cents)}${b.deposit_kept_cents ? ` (kept ${money(b.deposit_kept_cents)} for ${esc(b.deposit_kept_reason || "")})` : ""} on ${esc(niceDate(b.deposit_settled_at.slice(0, 10)))}`
@@ -349,10 +378,16 @@ async function myPage(env, s, token, url) {
   ${["cancelled", "returned", "closed", "pending"].includes(b.status) ? "" : `
   <section class="card"><h2>Pickup</h2>
     ${pickupBlock}
-    ${editable ? `<form id="pick" class="row">
-        <input type="date" id="pick-date" min="${min}" max="${max}" value="${esc(b.pickup_date && b.pickup_date >= min ? b.pickup_date : "")}" required>
-        <button>${b.pickup_date ? "Change pickup day" : "Schedule pickup"}</button></form>
-      ${b.pickup_date ? `<p><button type="button" id="unpick" class="link">Cancel my pickup request</button></p>` : ""}
+    ${editable ? `<form id="pick">
+        <label class="choice"><input type="radio" name="method" value="pickup"${dropoff ? "" : " checked"}> <span><b>Pick it up from me</b> (free, inside our service area)</span></label>
+        <div id="pick-addr"${dropoff ? " hidden" : ""}>
+          <label>Pickup address <small>(moved? enter your new address)</small> <input id="pick-address" maxlength="200" value="${esc(b.pickup_address || b.address)}"></label>
+          <label>Zip <input id="pick-zip" inputmode="numeric" maxlength="5" value="${esc(b.pickup_zip || b.zip)}"></label>
+        </div>
+        <label class="choice"><input type="radio" name="method" value="dropoff"${dropoff ? " checked" : ""}> <span><b>I'll drop it off</b> at your Sikeston location (free). <small>Required if you're moving outside our service area.</small></span></label>
+        <label>Day <input type="date" id="pick-date" min="${min}" max="${max}" value="${esc(b.pickup_date && b.pickup_date >= min ? b.pickup_date : "")}" required></label>
+        <button>${b.pickup_date ? "Update" : "Schedule"}</button></form>
+      ${b.pickup_date ? `<p><button type="button" id="unpick" class="link">Cancel my ${dropoff ? "drop-off" : "pickup"}</button></p>` : ""}
       <p class="muted">Billing stops once we've picked everything up.${b.plan === "storage" ? " The first month is a minimum; after that, unused full weeks of your last month are refunded after pickup." : ""}</p>`
       : b.pickup_date ? `<p class="muted">Need to change today's pickup? <a href="/#contact">Contact us</a>.</p>` : ""}
     <p id="pick-msg" class="msg"></p>
@@ -375,7 +410,10 @@ async function myPage(env, s, token, url) {
   const post = (what, body, msgId) => fetch(base + "/" + what, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) })
     .then((r) => r.json()).catch(() => ({ ok: false, msg: "Something went wrong. Please try again." }))
     .then((r) => { if (r.ok) location.href = location.pathname + "?msg=" + encodeURIComponent(r.msg); else { const e = $(msgId); e.textContent = r.msg; e.className = "msg err"; } });
-  $("pick") && $("pick").addEventListener("submit", (e) => { e.preventDefault(); post("pickup", { date: $("pick-date").value }, "pick-msg"); });
+  document.querySelectorAll("input[name=method]").forEach((r) => r.addEventListener("change", () => { $("pick-addr").hidden = r.value === "dropoff" && r.checked; }));
+  $("pick") && $("pick").addEventListener("submit", (e) => { e.preventDefault();
+    const m = document.querySelector("input[name=method]:checked").value;
+    post("pickup", { date: $("pick-date").value, method: m, address: $("pick-address").value, zip: $("pick-zip").value }, "pick-msg"); });
   $("unpick") && $("unpick").addEventListener("click", () => { if (confirm("Cancel your pickup request?")) post("cancel_pickup", {}, "pick-msg"); });
   $("est") && $("est").addEventListener("submit", (e) => { e.preventDefault(); post("estimate", { date: $("est-date").value }, "est-msg"); });
   $("cancel-booking") && $("cancel-booking").addEventListener("click", (e) => { if (confirm("Cancel your booking? The cancellation fee is " + e.target.dataset.fee + ".")) post("cancel_booking", {}, "cancel-msg"); });
@@ -419,19 +457,32 @@ async function myAction(request, env, s, token, action) {
     return json(200, { ok: true, msg: "Your pickup request was cancelled." });
   }
 
-  // action === "pickup"
+  // action === "pickup": we collect at an address inside the service area, or the customer drops it off.
+  const method = body.method === "dropoff" ? "dropoff" : "pickup";
+  // Default to the address already on file (pickup address if they moved, else delivery address).
+  const addr = String(body.address || b.pickup_address || b.address || "").trim().slice(0, 200), zip = String(body.zip || b.pickup_zip || b.zip || "").trim();
   const min = earliestPickup(b, s);
-  if (!isDate(date)) return json(400, { ok: false, msg: "Pick a pickup day." });
-  if (date < min) return json(400, { ok: false, msg: `The earliest pickup day is ${niceDate(min)}.` });
+  if (!isDate(date)) return json(400, { ok: false, msg: "Pick a day." });
+  if (date < min) return json(400, { ok: false, msg: `The earliest day is ${niceDate(min)}.` });
   if (date > addDays(today(), 365)) return json(400, { ok: false, msg: "Pick a day within the next year." });
-  await db.prepare(`UPDATE bookings SET pickup_date = ?, est_return_date = ?, status = CASE WHEN status = 'delivered' THEN 'pickup_requested' ELSE status END,
-    updated_at = datetime('now') WHERE id = ?`).bind(date, date, b.id).run();
-  await log("pickup", b.pickup_date ? `customer moved pickup ${b.pickup_date} → ${date}` : `customer scheduled pickup ${date}`);
-  await trySend(env, { to: b.email, subject: `Pickup scheduled: ${niceDate(date)}`, replyTo: owner ? `<${owner}>` : undefined,
-    text: `Hi ${b.name},\n\nYour pickup is scheduled for ${niceDate(date)}.\n\nPlease have all totes EMPTY and everything together by morning:\n12 totes with lids, the hand truck, moving blankets, furniture sliders, lifting straps and load straps.\nWe pick up the empty totes and equipment; we don't move your belongings.\n\nNeed to change it? ${myLink(b)}\n\nThanks!\nTotes Totes Totes\n` });
-  if (owner) await trySend(env, { to: owner, fromName: "3totes bookings", subject: `Pickup ${b.pickup_date ? "changed" : "scheduled"}: ${date}, booking #${b.id}`,
-    text: `${b.name} ${b.pickup_date ? `moved pickup from ${niceDate(b.pickup_date)} to` : "scheduled pickup for"} ${niceDate(date)}.\n${b.address}, ${b.zip} | ${b.phone}\n\nhttps://3totes.com/admin/bookings/${b.id}\n` });
-  return json(200, { ok: true, msg: `Pickup scheduled for ${niceDate(date)}. We sent you a confirmation email.` });
+  if (method === "pickup") {
+    if (!addr || !/^\d{5}$/.test(zip)) return json(400, { ok: false, msg: "Enter the pickup address and a 5-digit zip." });
+    const inArea = await db.prepare("SELECT 1 FROM zones WHERE zip = ?").bind(zip).first();
+    if (!inArea) return json(400, { ok: false, msg: "That address is outside our service area, so we can't pick up there. Please choose \"I'll drop it off\" and bring the kit back to us before you leave." });
+  }
+  const label = method === "dropoff" ? "drop-off" : "pickup";
+  await db.prepare(`UPDATE bookings SET pickup_date = ?, est_return_date = ?, return_method = ?, pickup_address = ?, pickup_zip = ?,
+    status = CASE WHEN status = 'delivered' THEN 'pickup_requested' ELSE status END, updated_at = datetime('now') WHERE id = ?`)
+    .bind(date, date, method, method === "pickup" ? addr : null, method === "pickup" ? zip : null, b.id).run();
+  await log("pickup", `${b.pickup_date ? `customer changed to ${label}` : `customer scheduled ${label}`} ${date}${method === "pickup" ? ` at ${addr}, ${zip}` : ""}`);
+  const where = method === "pickup" ? `We'll pick up at: ${addr}, ${zip}\n\nPlease have all totes EMPTY and everything together by morning.\nWe pick up the empty totes and equipment; we don't move your belongings.`
+    : `Please bring the kit to our Sikeston location that day. ${s.pickup_location_text || ""}\nTotes should be EMPTY.`;
+  const items = `12 totes with lids${b.addon_packs ? ` + ${b.addon_packs * ADDON_PACK_SIZE} extra totes` : ""}, the hand truck, moving blankets, furniture sliders, lifting straps and load straps.`;
+  await trySend(env, { to: b.email, subject: `${label === "pickup" ? "Pickup" : "Drop-off"} scheduled: ${niceDate(date)}`, replyTo: owner ? `<${owner}>` : undefined,
+    text: `Hi ${b.name},\n\nYour ${label} is scheduled for ${niceDate(date)}.\n\n${where}\n\nWhat comes back: ${items}\n\nNeed to change it? ${myLink(b)}\n\nThanks!\nTotes Totes Totes\n` });
+  if (owner) await trySend(env, { to: owner, fromName: "3totes bookings", subject: `${label === "pickup" ? "Pickup" : "Drop-off"} ${b.pickup_date ? "changed" : "scheduled"}: ${date}, booking #${b.id}`,
+    text: `${b.name}: ${label} on ${niceDate(date)}.\n${method === "pickup" ? `${addr}, ${zip}` : "Customer is bringing it to you."} | ${b.phone}\n\nhttps://3totes.com/admin/bookings/${b.id}\n` });
+  return json(200, { ok: true, msg: `${label === "pickup" ? "Pickup" : "Drop-off"} scheduled for ${niceDate(date)}. We sent you a confirmation email.` });
 }
 
 // ---------- public price list (/prices) ----------
@@ -483,10 +534,14 @@ ${preview ? `<div class="banner">PREVIEW: online booking is OFF. Payments use th
   <div id="done" class="card ok" hidden><h2>You're booked!</h2><p>Check your email for the details. We'll see you first thing in the morning on your delivery day.</p></div>
 
   <form id="f" novalidate>
-  <section class="card" id="s-zip"><h2><span>1</span> Where are we delivering?</h2>
-    <label>Zip code <input id="zip" inputmode="numeric" maxlength="5" autocomplete="postal-code" required></label>
+  <section class="card" id="s-zip"><h2><span>1</span> Where are you?</h2>
+    <label>Your zip code <input id="zip" inputmode="numeric" maxlength="5" autocomplete="postal-code" required></label>
     <p id="zip-msg" class="msg"></p>
-    <div id="wait" hidden><p>We don't deliver there yet. Leave your email and we'll let you know when we do.</p>
+    <div id="ful" hidden>
+      <label class="choice" id="ful-del-wrap"><input type="radio" name="ful" value="delivery"> <span><b>Deliver to me</b> <small id="ful-del-note"></small></span></label>
+      <label class="choice"><input type="radio" name="ful" value="self"> <span><b>I'll pick it up</b> at your Sikeston location and bring it back when I'm done (free)</span></label>
+    </div>
+    <div id="wait" hidden><p class="muted">We don't deliver there yet, but you can pick up the kit yourself. Want to know when we deliver to you?</p>
       <div class="row"><input id="wait-email" type="email" placeholder="you@example.com"><button type="button" id="wait-btn">Notify me</button></div></div>
   </section>
 
@@ -496,18 +551,22 @@ ${preview ? `<div class="banner">PREVIEW: online booking is OFF. Payments use th
     <p class="muted" id="p-deposit"></p>
   </section>
 
-  <section class="card" id="s-date" hidden><h2><span>3</span> Pick your delivery day</h2>
-    <p class="muted">We drop off first thing in the morning. Keep the totes as long as you need.</p>
+  <section class="card" id="s-date" hidden><h2><span>3</span> <span id="date-title">Pick your delivery day</span></h2>
+    <p class="muted" id="date-note">We drop off first thing in the morning. Keep the totes as long as you need.</p>
     <div id="cal"></div><p id="date-msg" class="msg"></p>
     <label id="est-wrap" hidden>When do you think you'll be done? <small>(optional estimate, you can change it later)</small>
       <input id="est" type="date"></label>
+    <div id="addon-wrap" hidden>
+      <label>Need more totes? <small id="addon-note"></small>
+        <select id="addons"><option value="0">No extra totes</option></select></label>
+    </div>
   </section>
 
   <section class="card" id="s-info" hidden><h2><span>4</span> Your details</h2>
     <label>Name <input id="name" maxlength="100" autocomplete="name" required></label>
     <label>Phone <input id="phone" type="tel" maxlength="30" autocomplete="tel" required></label>
     <label>Email <input id="email" type="email" maxlength="200" autocomplete="email" required></label>
-    <label>Delivery address <input id="address" maxlength="200" autocomplete="street-address" required></label>
+    <label><span id="addr-label">Delivery address</span> <input id="address" maxlength="200" autocomplete="street-address" required></label>
     <label>Notes for the driver <small>(optional: gate code, where to leave the kit)</small> <textarea id="notes" maxlength="1000"></textarea></label>
   </section>
 
@@ -537,7 +596,7 @@ const q = C.preview ? "preview=" + encodeURIComponent(C.preview) : "";
 const api = (p, extra) => "/api/book/" + p + "?" + [q, extra].filter(Boolean).join("&");
 const money = (c) => "$" + (c / 100).toFixed(2);
 const nice = (d) => new Date(d + "T12:00:00Z").toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric", timeZone: "UTC" });
-const st = { zip: "", fee: 0, plan: "moving", date: "", dates: [] };
+const st = { zip: "", fee: 0, zoneFee: 0, served: false, ful: "", plan: "moving", date: "", dates: [], addon: null };
 const show = (id) => { $(id).hidden = false; };
 const msg = (id, t, err) => { const e = $(id); e.textContent = t || ""; e.className = "msg" + (err ? " err" : ""); };
 
@@ -548,21 +607,33 @@ $("p-storage").textContent = money(C.storageMonthly) + "/month, 1-month minimum 
 
 $("zip").addEventListener("input", async (e) => {
   const z = e.target.value.replace(/\D/g, "").slice(0, 5); e.target.value = z;
-  $("wait").hidden = true; msg("zip-msg", "");
+  $("wait").hidden = true; $("ful").hidden = true; msg("zip-msg", "");
   if (z.length !== 5) return;
   const r = await fetch(api("zip", "zip=" + z)).then((r) => r.json()).catch(() => ({}));
   if (!r.ok) return msg("zip-msg", r.msg || "Something went wrong.", true);
-  if (!r.served) { $("wait").hidden = false; return; }
-  st.zip = z; st.fee = r.fee_cents;
-  msg("zip-msg", "We deliver to " + z + "! " + (r.fee_cents ? "Delivery fee: " + money(r.fee_cents) + "." : "Free delivery."));
-  show("s-plan"); show("s-date"); loadDates();
+  st.zip = z; st.served = r.served; st.zoneFee = r.served ? r.fee_cents : 0;
+  $("ful").hidden = false;
+  const del = document.querySelector("input[name=ful][value=delivery]"), self = document.querySelector("input[name=ful][value=self]");
+  del.disabled = !r.served; $("ful-del-wrap").classList.toggle("off", !r.served);
+  $("ful-del-note").textContent = r.served ? (r.fee_cents ? "(delivery fee " + money(r.fee_cents) + ")" : "(free delivery)") : "(not available in " + z + " yet)";
+  if (!r.served) { $("wait").hidden = false; self.checked = true; } else if (!self.checked) del.checked = true;
+  setFul();
 });
+function setFul() {
+  const v = document.querySelector("input[name=ful]:checked"); if (!v) return;
+  st.ful = v.value; st.fee = st.ful === "delivery" ? st.zoneFee : 0;
+  $("addr-label").textContent = st.ful === "self" ? "Your address" : "Delivery address";
+  $("date-title").textContent = st.ful === "self" ? "Pick the day you'll get the kit" : "Pick your delivery day";
+  $("date-note").textContent = st.ful === "self" ? "We'll text you our Sikeston address and a time. Keep the totes as long as you need." : "We drop off first thing in the morning. Keep the totes as long as you need.";
+  show("s-plan"); show("s-date"); if (!st.dates.length) loadDates(); summary();
+}
+document.querySelectorAll("input[name=ful]").forEach((r) => r.addEventListener("change", setFul));
 $("wait-btn").addEventListener("click", async () => {
   const r = await fetch("/api/book/waitlist", { method: "POST", headers: { "content-type": "application/json" },
     body: JSON.stringify({ email: $("wait-email").value, zip: $("zip").value }) }).then((r) => r.json()).catch(() => ({}));
   $("wait").innerHTML = "<p>" + (r.msg || "Something went wrong.") + "</p>";
 });
-document.querySelectorAll("input[name=plan]").forEach((r) => r.addEventListener("change", () => { st.plan = r.value; st.date = ""; loadDates(); summary(); }));
+document.querySelectorAll("input[name=plan]").forEach((r) => r.addEventListener("change", () => { st.plan = r.value; st.date = ""; $("addons").value = "0"; $("addon-wrap").hidden = true; loadDates(); summary(); }));
 
 async function loadDates() {
   $("cal").innerHTML = "<p class='muted'>Loading available days...</p>";
@@ -589,32 +660,45 @@ function renderCal(first, last) {
     st.date = b.dataset.d; renderCal(first, last); msg("date-msg", "Delivery: " + nice(st.date) + ", first thing in the morning.");
     const nx = new Date(st.date + "T12:00:00Z"); nx.setUTCDate(nx.getUTCDate() + 1);
     $("est").min = nx.toISOString().slice(0, 10); if ($("est").value && $("est").value < $("est").min) $("est").value = "";
-    $("est-wrap").hidden = false;
+    $("est-wrap").hidden = false; loadAddons();
     show("s-info"); show("s-sign"); show("s-pay"); summary();
   }));
 }
+async function loadAddons() {
+  const r = await fetch(api("addons", "plan=" + st.plan + "&date=" + st.date)).then((r) => r.json()).catch(() => ({}));
+  if (!r.ok) return;
+  st.addon = r; const sel = $("addons"), keep = Math.min(Number(sel.value) || 0, r.max);
+  sel.innerHTML = "<option value='0'>No extra totes</option>" + Array.from({ length: r.max }, (_, i) => i + 1)
+    .map((n) => "<option value='" + n + "'>" + (n * r.packSize) + " extra totes (" + n + " pack" + (n > 1 ? "s" : "") + ")</option>").join("");
+  sel.value = String(keep);
+  $("addon-note").textContent = "packs of " + r.packSize + ": " + money(r.first) + (st.plan === "moving" ? " first 2 weeks, then " + money(r.recurring) + "/week" : "/month") + " per pack";
+  $("addon-wrap").hidden = r.max === 0 && keep === 0; summary();
+}
+$("addons").addEventListener("change", summary);
 function summary() {
   if (!st.date) { $("summary").innerHTML = ""; return; }
-  const moving = st.plan === "moving", first = moving ? C.movingFirst : C.storageMonthly;
+  const moving = st.plan === "moving", packs = Number($("addons").value) || 0, a = st.addon || { first: 0, recurring: 0, packSize: 4 };
+  const first = (moving ? C.movingFirst : C.storageMonthly) + packs * a.first, recurring = (moving ? C.movingWeekly : C.storageMonthly) + packs * a.recurring;
   const ren = new Date(st.date + "T12:00:00Z"); if (moving) ren.setUTCDate(ren.getUTCDate() + 14); else ren.setUTCMonth(ren.getUTCMonth() + 1);
   const renDate = ren.toISOString().slice(0, 10);
   $("summary").innerHTML = "<ul class='sum'><li><b>Today: " + money(C.deposit + first + st.fee) + "</b><ul>" +
     "<li>" + money(C.deposit) + " refundable deposit (back at pickup)</li>" +
-    "<li>" + money(first) + (moving ? " first 2 weeks (2-week minimum)" : " first month (1-month minimum)") + "</li>" +
+    "<li>" + money(first) + (moving ? " first 2 weeks (2-week minimum)" : " first month (1-month minimum)") + (packs ? ", including " + packs * a.packSize + " extra totes" : "") + "</li>" +
     (st.fee ? "<li>" + money(st.fee) + " delivery</li>" : "") + "</ul></li>" +
-    "<li>Your rental time starts when we deliver on " + nice(st.date) + ".</li>" +
-    "<li>Still have it after " + (moving ? "2 weeks" : "1 month") + "? " + money(moving ? C.movingWeekly : C.storageMonthly) + (moving ? " per week" : " per month") +
+    "<li>Your rental time starts " + (st.ful === "self" ? "when you pick up the kit on " : "when we deliver on ") + nice(st.date) + ".</li>" +
+    "<li>Still have it after " + (moving ? "2 weeks" : "1 month") + "? " + money(recurring) + (moving ? " per week" : " per month") +
     ", starting " + nice(renDate) + ", until pickup.</li></ul>" +
     "<p class='muted'>" + (moving ? "Partial weeks aren't refunded." : "After the first month, unused full weeks of your last month are refunded.") +
     " Cancel before delivery: " + C.cancelText + "</p>";
 }
 function form() {
-  return { zip: st.zip, plan: st.plan, date: st.date, est_return: $("est").value, name: $("name").value, phone: $("phone").value, email: $("email").value,
+  return { zip: st.zip, fulfillment: st.ful, addons: Number($("addons").value) || 0, plan: st.plan, date: st.date, est_return: $("est").value, name: $("name").value, phone: $("phone").value, email: $("email").value,
     address: $("address").value, notes: $("notes").value, agree: $("agree").checked, signed_name: $("signed").value };
 }
 function check() {
   const v = form();
-  if (!v.date) return "Pick a delivery day.";
+  if (!st.ful) return "Choose delivery or pickup.";
+  if (!v.date) return "Pick a day.";
   if (!v.name.trim() || !v.phone.trim() || !v.email.trim() || !v.address.trim()) return "Please fill in your name, phone, email and address.";
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v.email.trim())) return "Please enter a valid email address.";
   if (!v.agree || v.signed_name.trim().length < 2) return "Please check the agreement box and type your name to sign.";
@@ -632,7 +716,7 @@ function loadPayPal() {
     createSubscription: async () => {
       const r = await fetch(api("start"), { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(form()) })
         .then((r) => r.json()).catch(() => ({ ok: false }));
-      if (!r.ok) { msg("pay-msg", r.msg || "Something went wrong.", true); if (r.refresh) loadDates(); throw new Error("start failed"); }
+      if (!r.ok) { msg("pay-msg", r.msg || "Something went wrong.", true); if (r.refresh) loadDates(); if (r.refreshAddons) loadAddons(); throw new Error("start failed"); }
       booking = r; return r.subscriptionId;
     },
     onApprove: async (data) => {
@@ -666,7 +750,7 @@ h1{font-size:clamp(1.8rem,6vw,2.4rem);margin:.3em 0}.lede{color:var(--muted)}
 label{display:grid;gap:4px;margin:10px 0;font-size:.95rem}label.choice{display:flex;gap:10px;align-items:baseline;cursor:pointer}
 input:not([type=radio]):not([type=checkbox]),textarea{font:inherit;padding:10px 12px;border:1px solid #bbb;border-radius:8px;width:100%;background:#fff}
 textarea{min-height:80px}button{font:inherit;font-weight:600;padding:10px 16px;border:0;border-radius:8px;background:var(--yellow);color:var(--ink);cursor:pointer}
-.row{display:flex;gap:8px}.muted,small{color:var(--muted)}.msg{min-height:1.2em;margin:6px 0 0}.msg.err{color:var(--red)}
+.row{display:flex;gap:8px}label.off{opacity:.5}.muted,small{color:var(--muted)}.msg{min-height:1.2em;margin:6px 0 0}.msg.err{color:var(--red)}
 .cal{display:grid;grid-template-columns:repeat(7,1fr);gap:4px;text-align:center}.cal b{font-size:.8rem;color:var(--muted)}
 .cal i{grid-column:1/-1;text-align:left;font-style:normal;font-weight:700;margin-top:8px}
 .cal button,.cal span{padding:9px 0;border-radius:8px}.cal button{background:#fff;border:1.5px solid var(--ink)}.cal button:hover{background:#fff4bf}
