@@ -1,7 +1,7 @@
 // /admin: server-rendered pages for Christian (owner) and drivers.
 // Step 1 of BOOKING_DESIGN: kits, manual bookings, schedule, settings. No payments yet.
 import { adminIdentity } from "./access.js";
-import { ensureSchema, getSettings, kitConflict } from "./db.js";
+import { ensureSchema, getSettings, kitConflict, newToken } from "./db.js";
 import { paypalReady, refundSale, cancelSubscription } from "./paypal.js";
 
 const TZ = "America/Chicago";
@@ -102,7 +102,7 @@ async function schedule(db, who, flash) {
         AND (b.status = 'pickup_requested' OR (b.pickup_date IS NOT NULL AND b.pickup_date <= ?))
       ORDER BY b.pickup_date IS NULL, b.pickup_date, b.id`).bind(horizon).all()).results;
   const out = (await db.prepare(
-    `SELECT b.id, b.delivery_date, b.pickup_date, c.name, k.label AS kit FROM bookings b
+    `SELECT b.id, b.delivery_date, b.pickup_date, b.est_return_date, c.name, k.label AS kit FROM bookings b
        JOIN customers c ON c.id = b.customer_id JOIN kits k ON k.id = b.kit_id
       WHERE b.status IN ('delivered','pickup_requested') ORDER BY b.delivery_date`).all()).results;
 
@@ -126,7 +126,7 @@ async function schedule(db, who, flash) {
     <h2>Drop-offs</h2>${table(drops, "drop", "No drop-offs in the next 14 days.")}
     <h2>Pickups <small class="muted">(empty totes only)</small></h2>${table(pickups, "pick", "No pickups scheduled in the next 14 days.")}
     <h2>Out now</h2>${out.length
-      ? `<ul>${out.map((b) => `<li>${esc(b.kit)}: ${isOwner ? `<a href="/admin/bookings/${b.id}">${esc(b.name)}</a>` : esc(b.name)} since ${esc(niceDate(b.delivery_date))}${b.pickup_date ? `, pickup ${esc(niceDate(b.pickup_date))}` : ", open-ended"}</li>`).join("")}</ul>`
+      ? `<ul>${out.map((b) => `<li>${esc(b.kit)}: ${isOwner ? `<a href="/admin/bookings/${b.id}">${esc(b.name)}</a>` : esc(b.name)} since ${esc(niceDate(b.delivery_date))}${b.pickup_date ? `, pickup ${esc(niceDate(b.pickup_date))}` : b.est_return_date ? `, customer estimate ~${esc(niceDate(b.est_return_date))}` : ", open-ended"}</li>`).join("")}</ul>`
       : `<p class="muted">Nothing out right now.</p>`}`, flash);
 }
 
@@ -170,6 +170,7 @@ async function bookingForm(db, who, v, error) {
         <label>Zip <input name="zip" required pattern="\\d{5}" maxlength="5" value="${esc(v.zip)}"></label>
         <label>Delivery date <small>(drop-off first thing that morning)</small> <input name="delivery_date" type="date" required value="${esc(v.delivery_date)}"></label>
         <label>Pickup date <small>(blank = open-ended)</small> <input name="pickup_date" type="date" value="${esc(v.pickup_date)}"></label>
+        <label>Customer's estimated return <small>(info only)</small> <input name="est_return_date" type="date" value="${esc(v.est_return_date)}"></label>
       </fieldset>
       <fieldset><legend>Rental</legend>
         <label>Plan <select name="plan">
@@ -202,6 +203,7 @@ async function bookingCreate(db, who, request) {
   if (!isDate(v.delivery_date)) return fail("Pick a delivery date.");
   if (v.pickup_date && !isDate(v.pickup_date)) return fail("Pickup date is not a valid date.");
   if (v.pickup_date && v.pickup_date < v.delivery_date) return fail("Pickup date is before the delivery date.");
+  if (v.est_return_date && (!isDate(v.est_return_date) || v.est_return_date <= v.delivery_date)) return fail("Estimated return must be after the delivery date.");
   const deposit = toCents(v.deposit || "0");
   if (deposit === null) return fail("Deposit must be a dollar amount.");
   const kit = await db.prepare("SELECT id, label, status FROM kits WHERE id = ?").bind(Number(v.kit_id)).first();
@@ -219,9 +221,11 @@ async function bookingCreate(db, who, request) {
   }
   const status = v.status === "pending" ? "pending" : "confirmed";
   const b = await db.prepare(
-    `INSERT INTO bookings (customer_id, kit_id, plan, status, address, zip, delivery_date, pickup_date, notes, deposit_cents, agreement_version, source)
-     VALUES (?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), ?, ?, 'admin') RETURNING id`)
-    .bind(customer.id, kit.id, v.plan, status, v.address, v.zip, v.delivery_date, v.pickup_date || "", v.notes || "", deposit, s.agreement_version || null).first();
+    `INSERT INTO bookings (customer_id, kit_id, plan, status, address, zip, delivery_date, pickup_date, notes, deposit_cents, agreement_version, source,
+       est_return_date, manage_token)
+     VALUES (?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), ?, ?, 'admin', NULLIF(?, ''), ?) RETURNING id`)
+    .bind(customer.id, kit.id, v.plan, status, v.address, v.zip, v.delivery_date, v.pickup_date || "", v.notes || "", deposit, s.agreement_version || null,
+      v.est_return_date || "", newToken()).first();
   await logEvent(db, b.id, who, "created", `${v.plan}, ${kit.label}, delivery ${v.delivery_date}`);
   return redirect(`/admin/bookings/${b.id}?msg=${encodeURIComponent("Booking created.")}`);
 }
@@ -258,6 +262,8 @@ async function bookingView(db, who, id, flash, error = "") {
         <dt>Kit</dt><dd>${esc(b.kit)}</dd>
         <dt>Delivery</dt><dd>${esc(niceDate(b.delivery_date))}, first thing in the morning</dd>
         <dt>Pickup</dt><dd>${b.pickup_date ? esc(niceDate(b.pickup_date)) : "Open-ended"}</dd>
+        <dt>Est. return</dt><dd>${b.est_return_date ? esc(niceDate(b.est_return_date)) + " <small>(customer estimate)</small>" : "<span class='muted'>none</span>"}</dd>
+        <dt>Customer link</dt><dd>${b.manage_token ? `<input readonly value="https://3totes.com/my/${esc(b.manage_token)}" onclick="this.select()"><br><small>Their page to schedule pickup. Send it to manual-booking customers.</small>` : ""}</dd>
         <dt>Deposit</dt><dd>${money(b.deposit_cents)}${b.deposit_refunded_cents ? `, refunded ${money(b.deposit_refunded_cents)}` : ""}</dd>
         <dt>Agreement</dt><dd>${b.signed_at ? `Signed by ${esc(b.signed_name)} at ${esc(b.signed_at)}` : `Not signed online (${esc(b.agreement_version || "no version")})`}</dd>
         <dt>Source</dt><dd>${esc(b.source)}, created ${esc(b.created_at)} UTC</dd>
@@ -268,6 +274,7 @@ async function bookingView(db, who, id, flash, error = "") {
           <label>Kit <select name="kit_id">${kits.map((k) => `<option value="${k.id}"${k.id === b.kit_id ? " selected" : ""}>${esc(k.label)}</option>`).join("")}</select></label>
           <label>Delivery date <input name="delivery_date" type="date" required value="${esc(b.delivery_date)}"></label>
           <label>Pickup date <small>(blank = open-ended)</small> <input name="pickup_date" type="date" value="${esc(b.pickup_date || "")}"></label>
+          <label>Customer's estimated return <input name="est_return_date" type="date" value="${esc(b.est_return_date || "")}"></label>
           <label>Deposit refunded <input name="deposit_refunded" inputmode="decimal" value="${(b.deposit_refunded_cents / 100).toFixed(2)}"></label>
           <label>Notes <textarea name="notes" maxlength="2000">${esc(b.notes || "")}</textarea></label>
           <label>Log note <small>(added to the history)</small> <input name="log" maxlength="500"></label>
@@ -294,6 +301,7 @@ async function bookingUpdate(db, who, id, request, env) {
   const refunded = toCents(v.deposit_refunded || "0");
   if (refunded === null) return fail("Deposit refunded must be a dollar amount.");
   if (refunded > b.deposit_cents) return fail("Refund is more than the deposit.");
+  if (v.est_return_date && !isDate(v.est_return_date)) return fail("Estimated return is not a valid date.");
   const kitId = Number(v.kit_id) || b.kit_id;
 
   if (status !== "cancelled") {
@@ -307,12 +315,13 @@ async function bookingUpdate(db, who, id, request, env) {
   if (v.delivery_date !== b.delivery_date) changes.push(`delivery ${b.delivery_date} → ${v.delivery_date}`);
   if ((v.pickup_date || null) !== (b.pickup_date || null)) changes.push(`pickup ${b.pickup_date || "open"} → ${v.pickup_date || "open"}`);
   if (refunded !== b.deposit_refunded_cents) changes.push(`deposit refunded ${money(refunded)}`);
+  if ((v.est_return_date || null) !== (b.est_return_date || null)) changes.push(`estimate ${b.est_return_date || "none"} → ${v.est_return_date || "none"}`);
   if ((v.notes || "") !== (b.notes || "")) changes.push("notes edited");
 
   await db.prepare(
     `UPDATE bookings SET status = ?, kit_id = ?, delivery_date = ?, pickup_date = NULLIF(?, ''), deposit_refunded_cents = ?,
-       notes = NULLIF(?, ''), updated_at = datetime('now') WHERE id = ?`)
-    .bind(status, kitId, v.delivery_date, v.pickup_date || "", refunded, v.notes || "", id).run();
+       notes = NULLIF(?, ''), est_return_date = NULLIF(?, ''), updated_at = datetime('now') WHERE id = ?`)
+    .bind(status, kitId, v.delivery_date, v.pickup_date || "", refunded, v.notes || "", v.est_return_date || "", id).run();
   if (changes.length) await logEvent(db, id, who, "updated", changes.join("; "));
   if (v.log) await logEvent(db, id, who, "note", v.log);
   return redirect(`/admin/bookings/${id}?msg=${encodeURIComponent(changes.length || v.log ? "Saved." : "No changes.")}`);
@@ -325,6 +334,8 @@ async function kitsPage(db, who, flash) {
   const kits = (await db.prepare(
     `SELECT k.*, (SELECT b.id || '|' || c.name FROM bookings b JOIN customers c ON c.id = b.customer_id
                    WHERE b.kit_id = k.id AND b.status IN ('delivered','pickup_requested') LIMIT 1) AS out_with,
+            (SELECT COALESCE(b.pickup_date, '~' || b.est_return_date) FROM bookings b
+              WHERE b.kit_id = k.id AND b.status IN ('delivered','pickup_requested') LIMIT 1) AS back,
             (SELECT MIN(b.delivery_date) FROM bookings b
               WHERE b.kit_id = k.id AND b.status IN ('pending','confirmed') AND b.delivery_date >= ?) AS next_drop
        FROM kits k ORDER BY k.status = 'retired', k.label`).bind(t).all()).results;
@@ -335,7 +346,7 @@ async function kitsPage(db, who, flash) {
       const f = `kit-${k.id}`;
       return `<tr>
         <td><b>${esc(k.label)}</b></td>
-        <td>${k.out_with ? `Out: <a href="/admin/bookings/${esc(bid)}">${esc(bname)}</a>` : k.status === "retired" ? "Retired" : "Home"}</td>
+        <td>${k.out_with ? `Out: <a href="/admin/bookings/${esc(bid)}">${esc(bname)}</a>${k.back ? `<br><small>back ${k.back.startsWith("~") ? "~" + esc(niceDate(k.back.slice(1))) + " (estimate)" : esc(niceDate(k.back))}</small>` : "<br><small>no return date</small>"}` : k.status === "retired" ? "Retired" : "Home"}</td>
         <td>${k.next_drop ? esc(niceDate(k.next_drop)) : "<span class='muted'>none</span>"}</td>
         <td><select name="status" form="${f}">${KIT_STATUSES.map((s) => `<option${s === k.status ? " selected" : ""}>${s}</option>`).join("")}</select></td>
         <td><input name="notes" form="${f}" value="${esc(k.notes || "")}" maxlength="500"></td>

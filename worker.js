@@ -21,7 +21,8 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     if (url.pathname === "/api/contact") return handleContact(request, env);
-    if (url.pathname === "/book" || url.pathname === "/book/" || url.pathname.startsWith("/api/book/") || url.pathname === "/api/paypal/webhook") {
+    if (url.pathname === "/book" || url.pathname === "/book/" || url.pathname.startsWith("/api/book/") || url.pathname === "/api/paypal/webhook"
+        || url.pathname.startsWith("/my/") || url.pathname.startsWith("/api/my/")) {
       try { const r = await handleBook(request, env); if (r) return r; }
       catch (e) { console.error("book error:", e && e.stack); return Response.json({ ok: false, msg: "Something went wrong. Please try again." }, { status: 500 }); }
     }

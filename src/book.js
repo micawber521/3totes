@@ -1,7 +1,7 @@
 // Customer online booking (/book) + PayPal webhook.
 // Hidden behind the `online_booking` setting; while off, /book?preview=<booking_preview_key> still works
 // so Christian can test end to end (sandbox).
-import { ensureSchema, getSettings, kitBlocks, freeKit, kitConflict } from "./db.js";
+import { ensureSchema, getSettings, kitBlocks, freeKit, kitConflict, newToken } from "./db.js";
 import { paypalReady, createRentalSubscription, getSubscription, verifyWebhook } from "./paypal.js";
 import { trySend } from "./mail.js";
 
@@ -53,6 +53,13 @@ export async function handleBook(request, env) {
   const s = await getSettings(env.DB);
 
   if (p === "/book" && request.method === "GET") return access(s, url) ? bookPage(env, s, url) : comingSoon();
+  const my = p.match(/^\/my\/([0-9a-f]{48})$/);
+  if (my && request.method === "GET") return myPage(env, s, my[1], url);
+  const myApi = p.match(/^\/api\/my\/([0-9a-f]{48})\/(pickup|estimate|cancel_pickup)$/);
+  if (myApi && request.method === "POST") {
+    if (!["https://3totes.com", "https://www.3totes.com", url.origin].includes(request.headers.get("Origin") || "")) return json(403, { ok: false, msg: "Forbidden" });
+    return myAction(request, env, s, myApi[1], myApi[2]);
+  }
   if (!p.startsWith("/api/book/")) return null;
   if (request.method === "POST" && !["https://3totes.com", "https://www.3totes.com", url.origin].includes(request.headers.get("Origin") || ""))
     return json(403, { ok: false, msg: "Forbidden" });
@@ -92,13 +99,15 @@ async function start(request, env, s, url) {
   const b = await request.json().catch(() => null);
   if (!b) return json(400, { ok: false, msg: "Bad request" });
   const v = {};
-  for (const k of ["zip", "plan", "date", "name", "phone", "email", "address", "notes", "signed_name"]) v[k] = String(b[k] ?? "").trim();
+  for (const k of ["zip", "plan", "date", "est_return", "name", "phone", "email", "address", "notes", "signed_name"]) v[k] = String(b[k] ?? "").trim();
 
   if (!/^\d{5}$/.test(v.zip)) return json(400, { ok: false, msg: "Enter a 5-digit zip code." });
   const zone = await db.prepare("SELECT zone, delivery_fee_cents FROM zones WHERE zip = ?").bind(v.zip).first();
   if (!zone) return json(400, { ok: false, msg: "Sorry, we don't deliver to that zip code yet." });
   if (!["moving", "storage"].includes(v.plan)) return json(400, { ok: false, msg: "Pick a plan." });
   if (!isDate(v.date)) return json(400, { ok: false, msg: "Pick a delivery day." });
+  if (v.est_return && (!isDate(v.est_return) || v.est_return <= v.date || v.est_return > addDays(v.date, 365)))
+    return json(400, { ok: false, msg: "Your estimated pickup date should be after the delivery day." });
   if (!v.name || !v.phone || !v.email || !v.address) return json(400, { ok: false, msg: "Please fill in your name, phone, email and address." });
   for (const k of Object.keys(LIMITS)) if (v[k].length > LIMITS[k]) return json(400, { ok: false, msg: `That ${k} is too long.` });
   if (!emailOk(v.email)) return json(400, { ok: false, msg: "Please enter a valid email address." });
@@ -122,10 +131,11 @@ async function start(request, env, s, url) {
   const ip = request.headers.get("CF-Connecting-IP") || "";
   const booking = await db.prepare(
     `INSERT INTO bookings (customer_id, kit_id, plan, status, address, zip, delivery_date, notes, deposit_cents, delivery_fee_cents,
-       rate_first_cents, rate_recurring_cents, agreement_version, signed_name, signed_at, signed_ip, source, hold_expires_at)
-     VALUES (?, ?, ?, 'pending', ?, ?, ?, NULLIF(?, ''), ?, ?, ?, ?, ?, ?, datetime('now'), ?, 'online', datetime('now', ?)) RETURNING id`)
+       rate_first_cents, rate_recurring_cents, agreement_version, signed_name, signed_at, signed_ip, source, hold_expires_at,
+       est_return_date, manage_token)
+     VALUES (?, ?, ?, 'pending', ?, ?, ?, NULLIF(?, ''), ?, ?, ?, ?, ?, ?, datetime('now'), ?, 'online', datetime('now', ?), NULLIF(?, ''), ?) RETURNING id`)
     .bind(customer.id, kitId, v.plan, v.address, v.zip, v.date, v.notes, deposit, zone.delivery_fee_cents, r.first, r.recurring,
-      s.agreement_version || null, v.signed_name, ip, `+${HOLD_MINUTES} minutes`).first();
+      s.agreement_version || null, v.signed_name, ip, `+${HOLD_MINUTES} minutes`, v.est_return, newToken()).first();
 
   // Two customers racing for the same kit: the earlier booking wins.
   const clash = await kitConflict(db, { kitId, start: v.date, end: windowEnd, bufferDays: s.buffer_days, excludeId: booking.id });
@@ -178,6 +188,8 @@ export async function confirmBooking(env, bookingId, billingStatus, by) {
   await sendConfirmation(env, bookingId);
 }
 
+const myLink = (b) => `https://3totes.com/my/${b.manage_token}`;
+
 async function sendConfirmation(env, id) {
   const b = await env.DB.prepare(
     `SELECT b.*, c.name, c.email, c.phone FROM bookings b JOIN customers c ON c.id = b.customer_id WHERE b.id = ?`).bind(id).first();
@@ -190,7 +202,7 @@ async function sendConfirmation(env, id) {
 Your tote rental is booked. Booking #${b.id}.
 
 DELIVERY: ${niceDate(b.delivery_date)}, first thing in the morning
-ADDRESS: ${b.address}, ${b.zip}
+ADDRESS: ${b.address}, ${b.zip}${b.est_return_date ? `\nYOUR ESTIMATED PICKUP: ${niceDate(b.est_return_date)} (just an estimate, change it anytime)` : ""}
 
 ${planLine}
 Rental billing starts on your delivery day and renews automatically through PayPal.
@@ -198,7 +210,10 @@ Paid today: ${money(b.deposit_cents)} refundable deposit${b.delivery_fee_cents ?
 
 YOUR KIT: 12 totes with lids, a hand truck, moving blankets, furniture sliders, lifting straps and load straps.
 
-When you're done, reply to this email to schedule pickup. Please have the totes EMPTY and everything together.
+YOUR BOOKING PAGE (schedule pickup, update your estimate):
+${myLink(b)}
+
+When you're done, schedule your pickup on that page. Please have the totes EMPTY and everything together.
 We pick up the empty totes and equipment; we don't move your belongings.
 
 Your deposit is refunded after pickup and a quick check of the equipment.
@@ -212,7 +227,7 @@ Totes Totes Totes
     replyTo: owner ? `<${owner}>` : undefined });
   if (owner) await trySend(env, { to: owner, fromName: "3totes bookings",
     subject: `New booking #${b.id}: ${b.name}, ${b.delivery_date}`,
-    text: `New online booking #${b.id}\n\n${b.name} | ${b.phone} | ${b.email}\n${b.address}, ${b.zip}\nPlan: ${b.plan}\nDelivery: ${niceDate(b.delivery_date)}\nNotes: ${b.notes || "-"}\n\nhttps://3totes.com/admin/bookings/${b.id}\n` });
+    text: `New online booking #${b.id}\n\n${b.name} | ${b.phone} | ${b.email}\n${b.address}, ${b.zip}\nPlan: ${b.plan}\nDelivery: ${niceDate(b.delivery_date)}\nEstimated pickup: ${b.est_return_date ? niceDate(b.est_return_date) : "-"}\nNotes: ${b.notes || "-"}\n\nhttps://3totes.com/admin/bookings/${b.id}\n` });
 }
 
 // ---------- PayPal webhook ----------
@@ -279,6 +294,125 @@ async function handleEvent(env, ev) {
   }
 }
 
+// ---------- customer booking page (/my/<token>) ----------
+
+const MY_STATUS = {
+  pending: "Waiting for payment", confirmed: "Booked", delivered: "Delivered", pickup_requested: "Pickup scheduled",
+  returned: "Picked up", closed: "Complete", cancelled: "Cancelled",
+};
+
+async function myBooking(db, token) {
+  return db.prepare(`SELECT b.*, c.name, c.email, c.phone FROM bookings b JOIN customers c ON c.id = b.customer_id WHERE b.manage_token = ?`).bind(token).first();
+}
+
+// Customers can schedule/change pickup while the rental is active and the current pickup day hasn't arrived.
+function pickupEditable(b) {
+  if (!["confirmed", "delivered", "pickup_requested"].includes(b.status)) return false;
+  return !b.pickup_date || b.pickup_date > today();
+}
+const earliestPickup = (b, s) => {
+  const lead = addDays(today(), Math.max(1, Number(s.lead_days) || 1));
+  const afterDrop = addDays(b.delivery_date, 1);
+  return lead > afterDrop ? lead : afterDrop;
+};
+
+async function myPage(env, s, token, url) {
+  const b = await myBooking(env.DB, token);
+  if (!b) return new Response(`${PAGE_HEAD("Booking not found")}<main class="narrow center"><h1 class="marker">Booking not found</h1><p>Check the link in your confirmation email, or <a href="/#contact">contact us</a>.</p></main></body></html>`,
+    { status: 404, headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
+  const editable = pickupEditable(b);
+  const min = earliestPickup(b, s), max = addDays(today(), 365);
+  const flash = url.searchParams.get("msg") || "";
+  const planLine = b.plan === "moving"
+    ? `Moving plan: ${money(b.rate_first_cents)} for the first 2 weeks, then ${money(b.rate_recurring_cents)}/week`
+    : `Storage plan: ${money(b.rate_recurring_cents)}/month`;
+  const pickupBlock = b.pickup_date
+    ? `<p class="big">Pickup: <b>${esc(niceDate(b.pickup_date))}</b></p><p class="muted">Please have all totes <b>empty</b> and everything together by morning. We pick up the empty totes and equipment; we don't move your belongings.</p>`
+    : `<p>No pickup scheduled yet. Pick a day when you're done.</p>`;
+  return new Response(`${PAGE_HEAD("Your booking | Totes Totes Totes")}
+<main class="narrow">
+  <a href="/" class="home"><img src="/logo.svg" alt="Totes Totes Totes" class="logo small"></a>
+  <h1 class="marker">Hi ${esc(b.name.split(" ")[0])}!</h1>
+  ${flash ? `<p class="card ok">${esc(flash)}</p>` : ""}
+  <section class="card"><h2>Booking #${b.id}</h2>
+    <p>Status: <b>${esc(MY_STATUS[b.status] || b.status)}</b></p>
+    <p>Delivery: ${esc(niceDate(b.delivery_date))}, first thing in the morning<br>${esc(b.address)}, ${esc(b.zip)}</p>
+    ${b.rate_recurring_cents ? `<p class="muted">${esc(planLine)}</p>` : ""}
+  </section>
+  ${["cancelled", "returned", "closed", "pending"].includes(b.status) ? "" : `
+  <section class="card"><h2>Pickup</h2>
+    ${pickupBlock}
+    ${editable ? `<form id="pick" class="row">
+        <input type="date" id="pick-date" min="${min}" max="${max}" value="${esc(b.pickup_date && b.pickup_date >= min ? b.pickup_date : "")}" required>
+        <button>${b.pickup_date ? "Change pickup day" : "Schedule pickup"}</button></form>
+      ${b.pickup_date ? `<p><button type="button" id="unpick" class="link">Cancel my pickup request</button></p>` : ""}
+      <p class="muted">Billing stops once we've picked everything up.</p>`
+      : b.pickup_date ? `<p class="muted">Need to change today's pickup? <a href="/#contact">Contact us</a>.</p>` : ""}
+    <p id="pick-msg" class="msg"></p>
+  </section>
+  ${b.pickup_date ? "" : `<section class="card"><h2>Your estimate</h2>
+    <p class="muted">Not sure yet? Tell us roughly when you'll be done so we can plan. It doesn't schedule anything.</p>
+    <form id="est" class="row"><input type="date" id="est-date" min="${addDays(b.delivery_date, 1)}" max="${max}" value="${esc(b.est_return_date || "")}"><button>Save estimate</button></form>
+    <p id="est-msg" class="msg"></p></section>`}`}
+  <p class="muted center-text">Questions? <a href="/#contact">Contact us</a>.</p>
+</main>
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id), base = location.pathname.replace("/my/", "/api/my/");
+  const post = (what, body, msgId) => fetch(base + "/" + what, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) })
+    .then((r) => r.json()).catch(() => ({ ok: false, msg: "Something went wrong. Please try again." }))
+    .then((r) => { if (r.ok) location.href = location.pathname + "?msg=" + encodeURIComponent(r.msg); else { const e = $(msgId); e.textContent = r.msg; e.className = "msg err"; } });
+  $("pick") && $("pick").addEventListener("submit", (e) => { e.preventDefault(); post("pickup", { date: $("pick-date").value }, "pick-msg"); });
+  $("unpick") && $("unpick").addEventListener("click", () => { if (confirm("Cancel your pickup request?")) post("cancel_pickup", {}, "pick-msg"); });
+  $("est") && $("est").addEventListener("submit", (e) => { e.preventDefault(); post("estimate", { date: $("est-date").value }, "est-msg"); });
+})();
+</script></body></html>`, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "x-robots-tag": "noindex", "referrer-policy": "no-referrer" } });
+}
+
+async function myAction(request, env, s, token, action) {
+  const db = env.DB;
+  const b = await myBooking(db, token);
+  if (!b) return json(404, { ok: false, msg: "Booking not found." });
+  const body = await request.json().catch(() => ({}));
+  const date = String(body.date || "").trim();
+  const log = (act, detail) => db.prepare("INSERT INTO booking_events (booking_id, by_email, action, detail) VALUES (?, ?, ?, ?)").bind(b.id, b.email || "customer", act, detail).run();
+  const owner = ownerEmail(env);
+
+  if (action === "estimate") {
+    if (b.pickup_date) return json(400, { ok: false, msg: "Your pickup is already scheduled." });
+    if (date && (!isDate(date) || date <= b.delivery_date || date > addDays(today(), 365))) return json(400, { ok: false, msg: "Pick a date after your delivery day." });
+    await db.prepare("UPDATE bookings SET est_return_date = NULLIF(?, ''), updated_at = datetime('now') WHERE id = ?").bind(date, b.id).run();
+    await log("estimate", date ? `customer estimate ${date}` : "customer cleared estimate");
+    return json(200, { ok: true, msg: date ? "Thanks! We saved your estimate." : "Estimate cleared." });
+  }
+
+  if (!pickupEditable(b)) return json(409, { ok: false, msg: "This pickup can't be changed online anymore. Please contact us." });
+
+  if (action === "cancel_pickup") {
+    if (!b.pickup_date) return json(400, { ok: false, msg: "No pickup is scheduled." });
+    await db.prepare(`UPDATE bookings SET pickup_date = NULL, status = CASE WHEN status = 'pickup_requested' THEN 'delivered' ELSE status END,
+      updated_at = datetime('now') WHERE id = ?`).bind(b.id).run();
+    await log("pickup", `customer cancelled pickup (was ${b.pickup_date})`);
+    if (owner) await trySend(env, { to: owner, fromName: "3totes bookings", subject: `Pickup cancelled: booking #${b.id}, ${b.name}`,
+      text: `${b.name} cancelled their pickup for ${niceDate(b.pickup_date)}.\n\nhttps://3totes.com/admin/bookings/${b.id}\n` });
+    return json(200, { ok: true, msg: "Your pickup request was cancelled." });
+  }
+
+  // action === "pickup"
+  const min = earliestPickup(b, s);
+  if (!isDate(date)) return json(400, { ok: false, msg: "Pick a pickup day." });
+  if (date < min) return json(400, { ok: false, msg: `The earliest pickup day is ${niceDate(min)}.` });
+  if (date > addDays(today(), 365)) return json(400, { ok: false, msg: "Pick a day within the next year." });
+  await db.prepare(`UPDATE bookings SET pickup_date = ?, est_return_date = ?, status = CASE WHEN status = 'delivered' THEN 'pickup_requested' ELSE status END,
+    updated_at = datetime('now') WHERE id = ?`).bind(date, date, b.id).run();
+  await log("pickup", b.pickup_date ? `customer moved pickup ${b.pickup_date} → ${date}` : `customer scheduled pickup ${date}`);
+  await trySend(env, { to: b.email, subject: `Pickup scheduled: ${niceDate(date)}`, replyTo: owner ? `<${owner}>` : undefined,
+    text: `Hi ${b.name},\n\nYour pickup is scheduled for ${niceDate(date)}.\n\nPlease have all totes EMPTY and everything together by morning:\n12 totes with lids, the hand truck, moving blankets, furniture sliders, lifting straps and load straps.\nWe pick up the empty totes and equipment; we don't move your belongings.\n\nNeed to change it? ${myLink(b)}\n\nThanks!\nTotes Totes Totes\n` });
+  if (owner) await trySend(env, { to: owner, fromName: "3totes bookings", subject: `Pickup ${b.pickup_date ? "changed" : "scheduled"}: ${date}, booking #${b.id}`,
+    text: `${b.name} ${b.pickup_date ? `moved pickup from ${niceDate(b.pickup_date)} to` : "scheduled pickup for"} ${niceDate(date)}.\n${b.address}, ${b.zip} | ${b.phone}\n\nhttps://3totes.com/admin/bookings/${b.id}\n` });
+  return json(200, { ok: true, msg: `Pickup scheduled for ${niceDate(date)}. We sent you a confirmation email.` });
+}
+
 // ---------- pages ----------
 
 const PAGE_HEAD = (title) => `<!doctype html><html lang="en"><head><meta charset="utf-8">
@@ -327,6 +461,8 @@ ${preview ? `<div class="banner">PREVIEW: online booking is OFF. Payments use th
   <section class="card" id="s-date" hidden><h2><span>3</span> Pick your delivery day</h2>
     <p class="muted">We drop off first thing in the morning. Keep the totes as long as you need.</p>
     <div id="cal"></div><p id="date-msg" class="msg"></p>
+    <label id="est-wrap" hidden>When do you think you'll be done? <small>(optional estimate, you can change it later)</small>
+      <input id="est" type="date"></label>
   </section>
 
   <section class="card" id="s-info" hidden><h2><span>4</span> Your details</h2>
@@ -352,7 +488,7 @@ ${preview ? `<div class="banner">PREVIEW: online booking is OFF. Payments use th
 </main>
 <script>window.BOOK=${JSON.stringify(cfg).replace(/</g, "\\u003c")};</script>
 <script>${CLIENT_JS}</script></body></html>`,
-    { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "x-robots-tag": "noindex" } });
+    { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", ...(preview ? { "x-robots-tag": "noindex" } : {}) } });
 }
 
 const CLIENT_JS = String.raw`
@@ -411,6 +547,9 @@ function renderCal(first, last) {
   $("cal").innerHTML = html + "</div>";
   $("cal").querySelectorAll("button").forEach((b) => b.addEventListener("click", () => {
     st.date = b.dataset.d; renderCal(first, last); msg("date-msg", "Delivery: " + nice(st.date) + ", first thing in the morning.");
+    const nx = new Date(st.date + "T12:00:00Z"); nx.setUTCDate(nx.getUTCDate() + 1);
+    $("est").min = nx.toISOString().slice(0, 10); if ($("est").value && $("est").value < $("est").min) $("est").value = "";
+    $("est-wrap").hidden = false;
     show("s-info"); show("s-sign"); show("s-pay"); summary();
   }));
 }
@@ -423,7 +562,7 @@ function summary() {
     (st.fee ? " + " + money(st.fee) + " delivery" : "") + ")</li>" + plan + "</ul><p class='muted'>Cancel billing anytime by scheduling your pickup.</p>";
 }
 function form() {
-  return { zip: st.zip, plan: st.plan, date: st.date, name: $("name").value, phone: $("phone").value, email: $("email").value,
+  return { zip: st.zip, plan: st.plan, date: st.date, est_return: $("est").value, name: $("name").value, phone: $("phone").value, email: $("email").value,
     address: $("address").value, notes: $("notes").value, agree: $("agree").checked, signed_name: $("signed").value };
 }
 function check() {
@@ -487,4 +626,6 @@ textarea{min-height:80px}button{font:inherit;font-weight:600;padding:10px 16px;b
 .cal button.sel{background:var(--yellow)}.cal span.off{color:#bbb;text-decoration:line-through}.cal span.past{color:#ddd}
 .agreement{max-height:260px;overflow:auto;border:1px solid var(--line);border-radius:8px;padding:12px;font-size:.9rem;background:#fcfcfa}
 ul.sum{padding-left:20px}#paypal{margin-top:12px}
+.big{font-size:1.15rem}.center-text{text-align:center;margin-top:24px}.row input{flex:1}
+button.link{background:none;padding:0;color:#0b57d0;text-decoration:underline;font-weight:400}
 `;

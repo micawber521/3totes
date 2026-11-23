@@ -99,6 +99,12 @@ const MIGRATIONS = [
        ('lead_days', '1'),
        ('agreement_text', '')`,
   ]],
+  [3, [
+    `ALTER TABLE bookings ADD COLUMN est_return_date TEXT`,   // customer's estimate; informational only, never frees the kit
+    `ALTER TABLE bookings ADD COLUMN manage_token TEXT`,      // private customer link /my/<token>
+    `UPDATE bookings SET manage_token = lower(hex(randomblob(24))) WHERE manage_token IS NULL`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS bookings_manage_token ON bookings (manage_token)`,
+  ]],
 ];
 
 let ready = false;
@@ -166,3 +172,5 @@ export function freeKit({ kits, blocks }, start, end) {
   }
   return null;
 }
+
+export const newToken = () => [...crypto.getRandomValues(new Uint8Array(24))].map((x) => x.toString(16).padStart(2, "0")).join("");
