@@ -483,18 +483,18 @@ async function settingsPage(db, who, flash, url, env) {
       ${SETTING_FIELDS.map(([key, label, type]) => `<label>${esc(label)} <input name="${key}" ${type === "int" ? 'type="number" min="0" max="30"' : type === "count" ? 'type="number" min="0" max="9999"' : type === "money" ? 'inputmode="decimal"' : type === "longtext" ? 'maxlength="300"' : 'maxlength="50"'}
         value="${esc(type === "money" ? (Number(s[key] || 0) / 100).toFixed(2) : s[key] ?? "")}"></label>`).join("")}
       <button type="submit">Save settings</button></form>
-    <h2>Hubs</h2>
-    <p class="muted">Where customers pick up and return kits themselves. Addresses and hours go in their confirmation email and private booking page, never on the public site.
-      Uncheck <b>Is a hub</b> to stop offering it.</p>
-    <table><thead><tr><th>Name</th><th>Address</th><th>Hours</th><th>Is a hub</th><th></th></tr></thead><tbody>
+    <h2>Locations</h2>
+    <p class="muted">Places you keep kits. Check <b>Customer pickup/drop-off</b> for the ones customers can come to; customers call these "hubs".
+      Their address and hours go only in the confirmation email and private booking page, never on the public site.</p>
+    <table><thead><tr><th>Name</th><th>Address</th><th>Hours</th><th>Customer pickup/drop-off</th><th></th></tr></thead><tbody>
       ${allHubs().map((h) => `<tr>
         <td><input form="hub-${esc(h.key)}" name="name" value="${esc(h.name)}" maxlength="40" required></td>
         <td><input form="hub-${esc(h.key)}" name="address" value="${esc(h.address || "")}" maxlength="200" placeholder="Street, city"></td>
         <td><input form="hub-${esc(h.key)}" name="hours" value="${esc(h.hours || "")}" maxlength="120" placeholder="e.g. Mon-Sat 8am-6pm"></td>
-        <td><label class="check"><input type="checkbox" form="hub-${esc(h.key)}" name="active"${h.active ? " checked" : ""}> hub</label></td>
+        <td><label class="check"><input type="checkbox" form="hub-${esc(h.key)}" name="active"${h.active ? " checked" : ""}> yes</label></td>
         <td><form method="post" id="hub-${esc(h.key)}"><input type="hidden" name="section" value="hub"><input type="hidden" name="key" value="${esc(h.key)}"><button>Save</button></form></td></tr>`).join("")}
     </tbody></table>
-    <form method="post" class="inline" style="margin-top:8px"><input type="hidden" name="section" value="hub_add"><input name="name" placeholder="New hub name" maxlength="40" required><button>Add hub</button></form>
+    <form method="post" class="inline" style="margin-top:8px"><input type="hidden" name="section" value="hub_add"><input name="name" placeholder="New location name" maxlength="40" required><button>Add location</button></form>
     <h2>Rental agreement text</h2>
     <p class="muted">Shown on the booking page; customers sign it. Change the version above whenever you change this text.</p>
     <form method="post" class="grid"><input type="hidden" name="section" value="agreement">
@@ -516,18 +516,18 @@ async function settingsPost(db, request) {
       const others = await db.prepare("SELECT COUNT(*) n FROM hubs WHERE active = 1 AND key != ?").bind(v.key || "").first();
       const busy = await db.prepare(`SELECT id FROM bookings WHERE hub = ? AND status IN ('pending','confirmed','delivered','pickup_requested')
         AND NOT (status = 'pending' AND hold_expires_at IS NOT NULL AND hold_expires_at < datetime('now')) LIMIT 1`).bind(v.key || "").first();
-      if (busy) return redirect("/admin/settings?msg=" + encodeURIComponent(`Booking #${busy.id} still uses this hub. Move it first, then turn the hub off.`));
+      if (busy) return redirect("/admin/settings?msg=" + encodeURIComponent(`Booking #${busy.id} has a customer pickup or drop-off here. Move it first, then turn off customer pickup/drop-off.`));
       if (!others.n) { /* allowed: no hubs means no self pickup or hub returns */ }
     }
     await db.prepare("UPDATE hubs SET name = ?, address = NULLIF(?, ''), hours = NULLIF(?, ''), active = ? WHERE key = ?")
       .bind(v.name.slice(0, 40), (v.address || "").slice(0, 200), (v.hours || "").slice(0, 120), v.active === "on" ? 1 : 0, v.key || "").run();
-    return redirect("/admin/settings?msg=" + encodeURIComponent(`Saved ${v.name} hub.`));
+    return redirect("/admin/settings?msg=" + encodeURIComponent(`Saved ${v.name}.`));
   }
   if (v.section === "hub_add") {
     const key = (v.name || "").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "").slice(0, 30);
     if (!key) return redirect("/admin/settings?msg=" + encodeURIComponent("Hub needs a name."));
     const r = await db.prepare("INSERT OR IGNORE INTO hubs (key, name, sort) VALUES (?, ?, (SELECT COALESCE(MAX(sort), 0) + 10 FROM hubs))").bind(key, v.name.slice(0, 40)).run();
-    return redirect("/admin/settings?msg=" + encodeURIComponent(r.meta.changes ? `Added ${v.name} hub. Fill in its address and hours.` : "A hub with that name already exists."));
+    return redirect("/admin/settings?msg=" + encodeURIComponent(r.meta.changes ? `Added ${v.name}. Fill in its address and hours.` : "A location with that name already exists."));
   }
   if (v.section === "agreement") { await put("agreement_text", (v.agreement_text || "").slice(0, 50000)).run(); return redirect("/admin/settings?msg=" + encodeURIComponent("Agreement saved.")); }
   const stmts = [];
