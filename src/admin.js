@@ -13,6 +13,7 @@ const STATUS_LABEL = {
   returned: "Returned", closed: "Closed", cancelled: "Cancelled",
 };
 const KIT_STATUSES = ["active", "cleaning", "retired"];
+const KIT_TOTES = 12; // totes in a kit; a split kit adds all of them to the extra-tote pool
 // charge for one price-list line: package items are replaced by the whole pack.
 const lineCharge = (it, qty) => qty > 0 ? Math.ceil(qty / Math.max(1, it.pack_size)) * it.price_cents : 0;
 const packNote = (it) => it.pack_size > 1 ? `pack of ${it.pack_size}: any missing = whole pack` : "";
@@ -227,7 +228,7 @@ async function bookingCreate(db, who, request) {
   const kit = await db.prepare("SELECT id, label, status FROM kits WHERE id = ?").bind(Number(v.kit_id)).first();
   if (!kit || kit.status === "retired") return fail("Pick a kit.");
   const short = await db.prepare("SELECT totes_borrowed FROM kits WHERE id = ?").bind(kit.id).first();
-  if (short && short.totes_borrowed) return fail(`${kit.label} is short ${short.totes_borrowed} totes (lent out). Pick another kit or set Totes lent back to 0.`);
+  if (short && short.totes_borrowed) return fail(`${kit.label} is split for extra totes. Pick another kit, or uncheck Split on the Kits page.`);
   const packs = Number(v.addon_packs || 0);
   if (!Number.isInteger(packs) || packs < 0 || packs > 10) return fail("Extra tote packs must be 0-10.");
   if (packs && packs > await addonPacksAvailable(db, s, v.delivery_date, v.pickup_date || null)) return fail("Not enough spare totes for those dates (check Spare totes in Settings).");
@@ -406,18 +407,18 @@ async function kitsPage(db, who, flash) {
               WHERE b.kit_id = k.id AND b.status IN ('pending','confirmed') AND b.delivery_date >= ?) AS next_drop
        FROM kits k ORDER BY k.status = 'retired', k.label`).bind(t).all()).results;
   return page("Kits", who, `
-    <p class="muted">Took totes from a kit for an extra-tote order? Enter how many under <b>Totes lent</b>. That kit can't be booked until you set it back to 0,
-      and those totes count toward extra totes automatically.</p>
-    <table><thead><tr><th>Kit</th><th>Where</th><th>Next drop-off</th><th>Status</th><th>Totes lent</th><th>Notes</th><th></th></tr></thead><tbody>
+    <p class="muted">Need to break up a kit for an extra-tote order? Check <b>Split for extras</b>. That kit can't be booked while it's split,
+      and all ${KIT_TOTES} of its totes become extra totes (packs of ${ADDON_PACK_SIZE}). Uncheck it when the kit is whole again.</p>
+    <table><thead><tr><th>Kit</th><th>Where</th><th>Next drop-off</th><th>Status</th><th>Split for extras</th><th>Notes</th><th></th></tr></thead><tbody>
     ${kits.map((k) => {
       const [bid, bname] = (k.out_with || "").split("|");
       const f = `kit-${k.id}`;
       return `<tr>
         <td><b>${esc(k.label)}</b></td>
-        <td>${k.out_with ? `Out: <a href="/admin/bookings/${esc(bid)}">${esc(bname)}</a>${k.back ? `<br><small>back ${k.back.startsWith("~") ? "~" + esc(niceDate(k.back.slice(1))) + " (estimate)" : esc(niceDate(k.back))}</small>` : "<br><small>no return date</small>"}` : k.status === "retired" ? "Retired" : k.totes_borrowed ? `<b class="owed">Home, short ${k.totes_borrowed} totes</b><br><small>not rentable</small>` : "Home"}</td>
+        <td>${k.out_with ? `Out: <a href="/admin/bookings/${esc(bid)}">${esc(bname)}</a>${k.back ? `<br><small>back ${k.back.startsWith("~") ? "~" + esc(niceDate(k.back.slice(1))) + " (estimate)" : esc(niceDate(k.back))}</small>` : "<br><small>no return date</small>"}` : k.status === "retired" ? "Retired" : k.totes_borrowed ? `<b class="owed">Split for extra totes</b><br><small>not rentable</small>` : "Home"}</td>
         <td>${k.next_drop ? esc(niceDate(k.next_drop)) : "<span class='muted'>none</span>"}</td>
         <td><select name="status" form="${f}">${KIT_STATUSES.map((s) => `<option${s === k.status ? " selected" : ""}>${s}</option>`).join("")}</select></td>
-        <td><input name="totes_borrowed" form="${f}" type="number" min="0" max="12" value="${k.totes_borrowed}" style="width:70px"></td>
+        <td><input type="hidden" name="split_present" value="1" form="${f}"><label class="check"><input type="checkbox" name="split" form="${f}"${k.totes_borrowed ? " checked" : ""}> split</label></td>
         <td><input name="notes" form="${f}" value="${esc(k.notes || "")}" maxlength="500"></td>
         <td><form method="post" id="${f}"><input type="hidden" name="id" value="${k.id}"><button name="action" value="save">Save</button></form></td></tr>`;
     }).join("")}
@@ -438,18 +439,24 @@ async function kitsPost(db, request) {
   const back = (m) => redirect("/admin/kits?msg=" + encodeURIComponent(m));
   const kit = await db.prepare("SELECT * FROM kits WHERE id = ?").bind(Number(v.id)).first();
   if (!kit) return back("Kit not found.");
-  const lent = Number(v.totes_borrowed ?? kit.totes_borrowed);
-  if (!Number.isInteger(lent) || lent < 0 || lent > 12) return back("Totes lent must be 0 to 12.");
-  if (lent > kit.totes_borrowed) {
+  const lent = v.split_present ? (v.split === "on" ? KIT_TOTES : 0) : kit.totes_borrowed;
+  if (lent && !kit.totes_borrowed) {
     // Only borrow from a kit with nothing booked: a booked kit needs all 12 totes.
     const busy = await db.prepare(
       `SELECT id FROM bookings WHERE kit_id = ? AND status IN ('confirmed','delivered','pickup_requested','pending')
          AND NOT (status = 'pending' AND hold_expires_at IS NOT NULL AND hold_expires_at < datetime('now')) LIMIT 1`).bind(kit.id).first();
-    if (busy) return back(`${kit.label} has booking #${busy.id} on it. Borrow totes from a kit with nothing booked.`);
+    if (busy) return back(`${kit.label} has booking #${busy.id} on it. Split a kit with nothing booked.`);
+  }
+  if (!lent && kit.totes_borrowed) {
+    // Un-splitting takes 12 totes out of the extra pool; refuse if bookings still need them.
+    const s = await getSettings(db);
+    const free = await addonPacksAvailable(db, s, today(), null);
+    if (free < Math.ceil(kit.totes_borrowed / ADDON_PACK_SIZE))
+      return back(`Extra totes from ${kit.label} are still booked or out. Leave it split until they're back.`);
   }
   await db.prepare("UPDATE kits SET status = ?, notes = NULLIF(?, ''), totes_borrowed = ? WHERE id = ?").bind(v.status, v.notes || "", lent, kit.id).run();
   return back(lent !== kit.totes_borrowed
-    ? (lent ? `${kit.label}: ${lent} totes lent out. It can't be booked until this is back to 0.` : `${kit.label} is complete again and bookable.`)
+    ? (lent ? `${kit.label} is split: its ${KIT_TOTES} totes are now extra totes, and it can't be booked until you uncheck it.` : `${kit.label} is whole again and bookable.`)
     : "Saved.");
 }
 

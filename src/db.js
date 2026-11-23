@@ -162,8 +162,8 @@ const MIGRATIONS = [
        ('pickup_location_text', 'We will text you our Sikeston address and a time.')`,
   ]],
   [9, [
-    // Totes taken out of a kit for extra-tote orders: the kit can't be rented while > 0,
-    // and those totes join the extra-tote pool automatically.
+    // Kit split for extra totes (value = the kit's 12 totes, 0 = intact): a split kit can't be rented,
+    // and ALL its totes join the extra-tote pool (not just the ones the first order needed).
     `ALTER TABLE kits ADD COLUMN totes_borrowed INTEGER NOT NULL DEFAULT 0`,
   ]],
 ];
