@@ -1,7 +1,7 @@
 // /admin: server-rendered pages for Christian (owner) and drivers.
 // Step 1 of BOOKING_DESIGN: kits, manual bookings, schedule, settings. No payments yet.
 import { adminIdentity } from "./access.js";
-import { ensureSchema, getSettings, kitConflict, newToken, addonPacksAvailable, ADDON_PACK_SIZE, HUBS, hubName } from "./db.js";
+import { ensureSchema, getSettings, kitConflict, newToken, addonPacksAvailable, ADDON_PACK_SIZE, HUBS, hubName, allHubs } from "./db.js";
 import { paypalReady, refundSale, cancelSubscription } from "./paypal.js";
 import { trySend } from "./mail.js";
 import { cancelFee, cancelBooking } from "./cancel.js";
@@ -30,7 +30,7 @@ const SETTING_FIELDS = [
   ["addon_moving_first_cents", "Extra totes (pack of 4), moving: first 2 weeks", "money"],
   ["addon_moving_weekly_cents", "Extra totes (pack of 4), moving: each week after", "money"],
   ["addon_storage_monthly_cents", "Extra totes (pack of 4), storage: monthly", "money"],
-  ["pickup_location_text", "Customer pickup/drop-off instructions", "longtext"],
+  ["pickup_location_text", "Extra hub pickup/drop-off instructions (optional)", "longtext"],
   ["cancel_fee_early_cents", "Cancellation fee, early", "money"],
   ["cancel_fee_late_cents", "Cancellation fee, late", "money"],
   ["cancel_cutoff_days", "Early = at least this many days before delivery", "int"],
@@ -254,7 +254,7 @@ async function bookingCreate(db, who, request) {
        est_return_date, manage_token, fulfillment, addon_packs, return_method, hub)
      VALUES (?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), ?, ?, 'admin', NULLIF(?, ''), ?, ?, ?, ?, ?) RETURNING id`)
     .bind(customer.id, kit.id, v.plan, status, v.address, v.zip, v.delivery_date, v.pickup_date || "", v.notes || "", depositTotal, s.agreement_version || null,
-      v.est_return_date || "", newToken(), self ? "self" : "delivery", packs, self ? "dropoff" : "pickup", self ? (HUBS[v.hub] ? v.hub : "sikeston") : null).first();
+      v.est_return_date || "", newToken(), self ? "self" : "delivery", packs, self ? "dropoff" : "pickup", self ? (HUBS[v.hub] ? v.hub : Object.keys(HUBS)[0] || null) : null).first();
   await logEvent(db, b.id, who, "created", `${v.plan}, ${kit.label}, delivery ${v.delivery_date}`);
   return redirect(`/admin/bookings/${b.id}?msg=${encodeURIComponent("Booking created.")}`);
 }
@@ -483,6 +483,18 @@ async function settingsPage(db, who, flash, url, env) {
       ${SETTING_FIELDS.map(([key, label, type]) => `<label>${esc(label)} <input name="${key}" ${type === "int" ? 'type="number" min="0" max="30"' : type === "count" ? 'type="number" min="0" max="9999"' : type === "money" ? 'inputmode="decimal"' : type === "longtext" ? 'maxlength="300"' : 'maxlength="50"'}
         value="${esc(type === "money" ? (Number(s[key] || 0) / 100).toFixed(2) : s[key] ?? "")}"></label>`).join("")}
       <button type="submit">Save settings</button></form>
+    <h2>Hubs</h2>
+    <p class="muted">Where customers pick up and return kits themselves. Addresses and hours go in their confirmation email and private booking page, never on the public site.
+      Uncheck <b>Is a hub</b> to stop offering it.</p>
+    <table><thead><tr><th>Name</th><th>Address</th><th>Hours</th><th>Is a hub</th><th></th></tr></thead><tbody>
+      ${allHubs().map((h) => `<tr>
+        <td><input form="hub-${esc(h.key)}" name="name" value="${esc(h.name)}" maxlength="40" required></td>
+        <td><input form="hub-${esc(h.key)}" name="address" value="${esc(h.address || "")}" maxlength="200" placeholder="Street, city"></td>
+        <td><input form="hub-${esc(h.key)}" name="hours" value="${esc(h.hours || "")}" maxlength="120" placeholder="e.g. Mon-Sat 8am-6pm"></td>
+        <td><label class="check"><input type="checkbox" form="hub-${esc(h.key)}" name="active"${h.active ? " checked" : ""}> hub</label></td>
+        <td><form method="post" id="hub-${esc(h.key)}"><input type="hidden" name="section" value="hub"><input type="hidden" name="key" value="${esc(h.key)}"><button>Save</button></form></td></tr>`).join("")}
+    </tbody></table>
+    <form method="post" class="inline" style="margin-top:8px"><input type="hidden" name="section" value="hub_add"><input name="name" placeholder="New hub name" maxlength="40" required><button>Add hub</button></form>
     <h2>Rental agreement text</h2>
     <p class="muted">Shown on the booking page; customers sign it. Change the version above whenever you change this text.</p>
     <form method="post" class="grid"><input type="hidden" name="section" value="agreement">
@@ -497,6 +509,25 @@ async function settingsPost(db, request) {
   if (v.section === "new_preview") {
     const key = [...crypto.getRandomValues(new Uint8Array(12))].map((x) => x.toString(16).padStart(2, "0")).join("");
     await put("booking_preview_key", key).run(); return redirect("/admin/settings?msg=" + encodeURIComponent("New preview link created."));
+  }
+  if (v.section === "hub") {
+    if (!v.name) return redirect("/admin/settings?msg=" + encodeURIComponent("Hub needs a name."));
+    if (v.active !== "on") {
+      const others = await db.prepare("SELECT COUNT(*) n FROM hubs WHERE active = 1 AND key != ?").bind(v.key || "").first();
+      const busy = await db.prepare(`SELECT id FROM bookings WHERE hub = ? AND status IN ('pending','confirmed','delivered','pickup_requested')
+        AND NOT (status = 'pending' AND hold_expires_at IS NOT NULL AND hold_expires_at < datetime('now')) LIMIT 1`).bind(v.key || "").first();
+      if (busy) return redirect("/admin/settings?msg=" + encodeURIComponent(`Booking #${busy.id} still uses this hub. Move it first, then turn the hub off.`));
+      if (!others.n) { /* allowed: no hubs means no self pickup or hub returns */ }
+    }
+    await db.prepare("UPDATE hubs SET name = ?, address = NULLIF(?, ''), hours = NULLIF(?, ''), active = ? WHERE key = ?")
+      .bind(v.name.slice(0, 40), (v.address || "").slice(0, 200), (v.hours || "").slice(0, 120), v.active === "on" ? 1 : 0, v.key || "").run();
+    return redirect("/admin/settings?msg=" + encodeURIComponent(`Saved ${v.name} hub.`));
+  }
+  if (v.section === "hub_add") {
+    const key = (v.name || "").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "").slice(0, 30);
+    if (!key) return redirect("/admin/settings?msg=" + encodeURIComponent("Hub needs a name."));
+    const r = await db.prepare("INSERT OR IGNORE INTO hubs (key, name, sort) VALUES (?, ?, (SELECT COALESCE(MAX(sort), 0) + 10 FROM hubs))").bind(key, v.name.slice(0, 40)).run();
+    return redirect("/admin/settings?msg=" + encodeURIComponent(r.meta.changes ? `Added ${v.name} hub. Fill in its address and hours.` : "A hub with that name already exists."));
   }
   if (v.section === "agreement") { await put("agreement_text", (v.agreement_text || "").slice(0, 50000)).run(); return redirect("/admin/settings?msg=" + encodeURIComponent("Agreement saved.")); }
   const stmts = [];
@@ -763,7 +794,7 @@ async function zonesPage(db, who, flash) {
       <input name="zips" placeholder="63801, 63834 ..." required style="min-width:260px">
       <input name="zone" placeholder="Zone (e.g. Sikeston local)" required maxlength="50">
       <input name="fee" placeholder="Fee $" inputmode="decimal" value="0" style="width:90px">
-      <select name="hub"><option value="sikeston">Sikeston</option><option value="jackson">Jackson</option></select>
+      <select name="hub">${allHubs().map((h) => `<option value="${esc(h.key)}">${esc(h.name)}</option>`).join("")}</select>
       <button>Save</button></form>
     <h2>Waitlist</h2>
     ${wait.length ? `<ul>${wait.map((w) => `<li>${esc(w.zip || "no zip")}: ${w.n} ${w.n === 1 ? "person" : "people"}</li>`).join("")}</ul>` : `<p class="muted">Nobody yet.</p>`}`, flash);
@@ -778,7 +809,7 @@ async function zonesPost(db, request) {
   const fee = toCents(v.fee || "0");
   if (fee === null) return back("Fee must be a dollar amount.");
   if (!v.zone) return back("Give the zone a name.");
-  const hub = v.hub === "jackson" ? "jackson" : "sikeston";
+  const hub = allHubs().some((h) => h.key === v.hub) ? v.hub : (allHubs()[0] || {}).key || "sikeston";
   await db.batch(zips.map((z) => db.prepare(
     "INSERT INTO zones (zip, zone, delivery_fee_cents, hub) VALUES (?, ?, ?, ?) ON CONFLICT (zip) DO UPDATE SET zone = excluded.zone, delivery_fee_cents = excluded.delivery_fee_cents, hub = excluded.hub")
     .bind(z, v.zone.slice(0, 50), fee, hub)));

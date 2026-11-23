@@ -177,12 +177,21 @@ const MIGRATIONS = [
   [12, [
     `INSERT OR IGNORE INTO settings (key, value) VALUES ('deposit_per_pack_cents', '2000')`,  // added to the deposit per extra tote pack
   ]],
+  [13, [
+    // Hubs live in the database (addresses must never be in this public repo). active = offered to customers.
+    `CREATE TABLE IF NOT EXISTS hubs (
+       key TEXT PRIMARY KEY, name TEXT NOT NULL, address TEXT, hours TEXT,
+       active INTEGER NOT NULL DEFAULT 1, sort INTEGER NOT NULL DEFAULT 0
+     )`,
+    `INSERT OR IGNORE INTO hubs (key, name, sort) VALUES ('sikeston', 'Sikeston', 10), ('jackson', 'Jackson', 20)`,
+    `UPDATE settings SET value = '' WHERE key = 'pickup_location_text' AND value = 'We will text you the hub address and a time.'`,
+  ]],
 ];
 
 let ready = false;
 
 export async function ensureSchema(db) {
-  if (ready) return;
+  if (ready) { await loadHubs(db); return; }
   await db.prepare(
     "CREATE TABLE IF NOT EXISTS _migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT (datetime('now')))"
   ).run();
@@ -201,6 +210,7 @@ export async function ensureSchema(db) {
     }
   }
   ready = true;
+  await loadHubs(db);
 }
 
 export async function getSettings(db) {
@@ -261,8 +271,22 @@ export async function addonPacksAvailable(db, s, start, end, excludeId = 0) {
   return Math.max(0, Math.floor(((Number(s.spare_totes) || 0) + borrowed.n) / ADDON_PACK_SIZE) - row.n);
 }
 
-export const HUBS = { sikeston: "Sikeston", jackson: "Jackson" };
-export const hubName = (k) => HUBS[k] || "our";
+// Loaded from the hubs table on every request (ensureSchema). HUBS = active hubs only (key -> name).
+export let HUBS = {};
+let HUB_ROWS = [];
+export async function loadHubs(db) {
+  const { results } = await db.prepare("SELECT * FROM hubs ORDER BY sort, name").all();
+  HUB_ROWS = results;
+  HUBS = Object.fromEntries(results.filter((h) => h.active).map((h) => [h.key, h.name]));
+}
+export const allHubs = () => HUB_ROWS;
+export const hubName = (k) => (HUB_ROWS.find((h) => h.key === k) || {}).name || "our";
+// "Sikeston hub: 123 Main St (hours: ...)" — blank parts are left out.
+export function hubWhere(k) {
+  const h = HUB_ROWS.find((x) => x.key === k);
+  if (!h) return "our hub";
+  return `${h.name} hub${h.address ? `: ${h.address}` : ""}${h.hours ? ` (hours: ${h.hours})` : ""}`;
+}
 
 // In-memory version for the calendar: one query, then check every day cheaply.
 export async function addonState(db, s) {
