@@ -466,8 +466,9 @@ async function billingAction(db, who, b, v, env) {
   return back(`Refunded ${money(cents)}.`);
 }
 
-// Storage policy (2026-11-23): after pickup, refund each unused FULL week of the last paid month
-// at the weekly equivalent (monthly x 12 / 52). Moving plan: 2-week minimum, partial weeks not refunded.
+// Storage policy (2026-11-23): the FIRST month is a minimum (no refund). For renewal months, after pickup,
+// refund each unused FULL week of the last paid month at monthly x 12 / 52. Moving plan: 2-week minimum,
+// partial weeks not refunded. The amount stays editable so Christian can make exceptions.
 function rentalRefundInfo(b, pays) {
   const rentals = pays.filter((p) => p.kind === "rental" && p.paypal_id);
   if (!rentals.length) return null;
@@ -476,7 +477,9 @@ function rentalRefundInfo(b, pays) {
   const left = last.amount_cents - refunded;
   if (left <= 0) return null;
   let suggest = 0, note = b.plan === "moving" ? "Moving plan: 2-week minimum, partial weeks aren't refunded." : "Set a pickup date to calculate unused weeks.";
-  if (b.plan === "storage" && b.pickup_date) {
+  if (b.plan === "storage" && rentals.length === 1) {
+    note = "First month is a minimum charge: no refund (policy). Edit the amount only to make an exception.";
+  } else if (b.plan === "storage" && b.pickup_date) {
     const paid = new Date(last.created_at.replace(" ", "T") + "Z");
     const periodStart = paid.toLocaleDateString("en-CA", { timeZone: TZ });
     const d = new Date(periodStart + "T12:00:00Z"); d.setUTCMonth(d.getUTCMonth() + 1);

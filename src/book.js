@@ -196,7 +196,7 @@ async function sendConfirmation(env, id) {
   if (!b) return;
   const planLine = b.plan === "moving"
     ? `Moving plan: ${money(b.rate_first_cents)} for the first 2 weeks (2-week minimum), then ${money(b.rate_recurring_cents)} per week until we pick up.`
-    : `Storage plan: ${money(b.rate_recurring_cents)} per month until we pick up. After pickup, we refund any unused full weeks of your last month.`;
+    : `Storage plan: ${money(b.rate_recurring_cents)} per month until we pick up (1-month minimum). After the first month, we refund any unused full weeks of your last month after pickup.`;
   const text = `Hi ${b.name},
 
 Your tote rental is booked. Booking #${b.id}.
@@ -325,7 +325,7 @@ async function myPage(env, s, token, url) {
   const flash = url.searchParams.get("msg") || "";
   const planLine = b.plan === "moving"
     ? `Moving plan: ${money(b.rate_first_cents)} for the first 2 weeks (2-week minimum), then ${money(b.rate_recurring_cents)}/week`
-    : `Storage plan: ${money(b.rate_recurring_cents)}/month`;
+    : `Storage plan: ${money(b.rate_recurring_cents)}/month (1-month minimum)`;
   const pickupBlock = b.pickup_date
     ? `<p class="big">Pickup: <b>${esc(niceDate(b.pickup_date))}</b></p><p class="muted">Please have all totes <b>empty</b> and everything together by morning. We pick up the empty totes and equipment; we don't move your belongings.</p>`
     : `<p>No pickup scheduled yet. Pick a day when you're done.</p>`;
@@ -346,7 +346,7 @@ async function myPage(env, s, token, url) {
         <input type="date" id="pick-date" min="${min}" max="${max}" value="${esc(b.pickup_date && b.pickup_date >= min ? b.pickup_date : "")}" required>
         <button>${b.pickup_date ? "Change pickup day" : "Schedule pickup"}</button></form>
       ${b.pickup_date ? `<p><button type="button" id="unpick" class="link">Cancel my pickup request</button></p>` : ""}
-      <p class="muted">Billing stops once we've picked everything up.${b.plan === "storage" ? " Unused full weeks of your last month are refunded after pickup." : ""}</p>`
+      <p class="muted">Billing stops once we've picked everything up.${b.plan === "storage" ? " The first month is a minimum; after that, unused full weeks of your last month are refunded after pickup." : ""}</p>`
       : b.pickup_date ? `<p class="muted">Need to change today's pickup? <a href="/#contact">Contact us</a>.</p>` : ""}
     <p id="pick-msg" class="msg"></p>
   </section>
@@ -504,7 +504,7 @@ const msg = (id, t, err) => { const e = $(id); e.textContent = t || ""; e.classN
 
 if (C.done) { $("done").hidden = false; $("f").hidden = true; return; }
 $("p-moving").textContent = money(C.movingFirst) + " for the first 2 weeks (2-week minimum), then " + money(C.movingWeekly) + "/week";
-$("p-storage").textContent = money(C.storageMonthly) + "/month (unused full weeks refunded after pickup)";
+$("p-storage").textContent = money(C.storageMonthly) + "/month, 1-month minimum (after that, unused full weeks are refunded after pickup)";
 
 $("zip").addEventListener("input", async (e) => {
   const z = e.target.value.replace(/\D/g, "").slice(0, 5); e.target.value = z;
@@ -557,10 +557,10 @@ function summary() {
   if (!st.date) { $("summary").innerHTML = ""; return; }
   const plan = st.plan === "moving"
     ? "<li>On " + nice(st.date) + ": " + money(C.movingFirst) + " (first 2 weeks, 2-week minimum)</li><li>Then " + money(C.movingWeekly) + " every week until pickup</li>"
-    : "<li>On " + nice(st.date) + ": " + money(C.storageMonthly) + ", then monthly until pickup</li>";
+    : "<li>On " + nice(st.date) + ": " + money(C.storageMonthly) + " (first month, 1-month minimum)</li><li>Then " + money(C.storageMonthly) + " every month until pickup</li>";
   $("summary").innerHTML = "<ul class='sum'><li><b>Today: " + money(C.deposit + st.fee) + "</b> (" + money(C.deposit) + " refundable deposit" +
     (st.fee ? " + " + money(st.fee) + " delivery" : "") + ")</li>" + plan + "</ul><p class='muted'>Billing stops when we pick up." +
-    (st.plan === "storage" ? " Unused full weeks of your last month are refunded." : " Partial weeks aren't refunded.") + "</p>";
+    (st.plan === "storage" ? " After the first month, unused full weeks of your last month are refunded." : " Partial weeks aren't refunded.") + "</p>";
 }
 function form() {
   return { zip: st.zip, plan: st.plan, date: st.date, est_return: $("est").value, name: $("name").value, phone: $("phone").value, email: $("email").value,
