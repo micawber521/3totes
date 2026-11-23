@@ -24,6 +24,7 @@ const SETTING_FIELDS = [
   ["storage_monthly_cents", "Storage plan, monthly", "money"],
   ["buffer_days", "Turnaround days between rentals", "int"],
   ["lead_days", "Days of notice before a delivery (online)", "int"],
+  ["booking_horizon_days", "How far ahead customers can book (days)", "count"],
   ["spare_totes", "Spare totes on hand (for extra-tote packs)", "count"],
   ["addon_moving_first_cents", "Extra totes (pack of 4), moving: first 2 weeks", "money"],
   ["addon_moving_weekly_cents", "Extra totes (pack of 4), moving: each week after", "money"],
@@ -786,7 +787,7 @@ async function zonesPost(db, request) {
 
 const CSS = `
 :root{--ink:#111;--muted:#666;--line:#ddd;--bg:#fafaf7;--card:#fff;--yellow:#f5c400;--red:#b3261e}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+*{box-sizing:border-box}[hidden]{display:none!important}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
 header{display:flex;flex-wrap:wrap;gap:8px 20px;align-items:center;padding:10px 16px;background:var(--ink);color:#fff}
 header a{color:#fff;text-decoration:none}header nav{display:flex;flex-wrap:wrap;gap:4px 16px}header nav a:hover{color:var(--yellow)}
 .brand{font-weight:700;color:var(--yellow)!important}.who{margin-left:auto;font-size:.85rem;opacity:.75}

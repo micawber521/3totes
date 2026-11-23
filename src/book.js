@@ -42,7 +42,8 @@ const isSelf = (b) => b.fulfillment === "self";
 
 async function availableDates(db, s, plan) {
   const lead = Math.max(1, Number(s.lead_days) || 1); // drop-off is first thing in the morning → never same day
-  const first = addDays(today(), lead), last = addDays(today(), 75);
+  const horizon = Math.min(400, Math.max(30, Number(s.booking_horizon_days) || 180));
+  const first = addDays(today(), lead), last = addDays(today(), horizon);
   const state = await kitBlocks(db, s.buffer_days);
   const out = [];
   for (let d = first; d <= last; d = addDays(d, 1)) {
@@ -645,24 +646,31 @@ async function loadDates() {
   $("cal").innerHTML = "<p class='muted'>Loading available days...</p>";
   const r = await fetch(api("dates", "plan=" + st.plan)).then((r) => r.json()).catch(() => ({}));
   if (!r.ok) { $("cal").innerHTML = ""; return msg("date-msg", r.msg || "Couldn't load dates.", true); }
-  st.dates = r.dates; renderCal(r.first, r.last);
+  st.dates = r.dates; st.first = r.first; st.last = r.last;
+  const startFrom = st.date || r.dates[0] || r.first; st.month = startFrom.slice(0, 7);
+  renderCal(r.first, r.last);
   if (!r.dates.length) msg("date-msg", "Sorry, every kit is booked right now. Please check back soon.", true); else msg("date-msg", "");
 }
+// One month at a time, with arrows; only days a kit is free are clickable.
+function shiftMonth(ym, n) { const d = new Date(ym + "-01T12:00:00Z"); d.setUTCMonth(d.getUTCMonth() + n); return d.toISOString().slice(0, 7); }
 function renderCal(first, last) {
-  const avail = new Set(st.dates);
-  const d0 = new Date(first + "T12:00:00Z"); d0.setUTCDate(d0.getUTCDate() - d0.getUTCDay());
-  let html = "<div class='cal'>" + ["S","M","T","W","T","F","S"].map((d) => "<b>" + d + "</b>").join("");
-  let month = "";
-  for (let d = new Date(d0); d.toISOString().slice(0, 10) <= last; d.setUTCDate(d.getUTCDate() + 1)) {
+  const avail = new Set(st.dates), ym = st.month, firstM = first.slice(0, 7), lastM = last.slice(0, 7);
+  const m0 = new Date(ym + "-01T12:00:00Z"), title = m0.toLocaleDateString("en-US", { month: "long", year: "numeric", timeZone: "UTC" });
+  const freeThisMonth = st.dates.filter((d) => d.startsWith(ym)).length;
+  let html = "<div class='calnav'><button type='button' id='cal-prev'" + (ym <= firstM ? " disabled" : "") + " aria-label='Previous month'>&#8249;</button>" +
+    "<b>" + title + "</b><button type='button' id='cal-next'" + (ym >= lastM ? " disabled" : "") + " aria-label='Next month'>&#8250;</button></div>" +
+    "<div class='cal'>" + ["S","M","T","W","T","F","S"].map((d) => "<b>" + d + "</b>").join("");
+  for (let i = 0; i < m0.getUTCDay(); i++) html += "<span></span>";
+  for (let d = new Date(m0); d.toISOString().slice(0, 7) === ym; d.setUTCDate(d.getUTCDate() + 1)) {
     const ymd = d.toISOString().slice(0, 10);
-    const m = d.toLocaleDateString("en-US", { month: "long", timeZone: "UTC" });
-    if (d.getUTCDay() === 0 && m !== month) { html += "<i>" + m + "</i>"; month = m; }
-    const ok = avail.has(ymd);
-    html += ok ? "<button type='button' data-d='" + ymd + "' class='" + (ymd === st.date ? "sel" : "") + "'>" + d.getUTCDate() + "</button>"
-               : "<span class='" + (ymd < first ? "past" : "off") + "'>" + d.getUTCDate() + "</span>";
+    html += avail.has(ymd) ? "<button type='button' data-d='" + ymd + "' class='" + (ymd === st.date ? "sel" : "") + "'>" + d.getUTCDate() + "</button>"
+      : "<span class='" + (ymd < first || ymd > last ? "past" : "off") + "'>" + d.getUTCDate() + "</span>";
   }
-  $("cal").innerHTML = html + "</div>";
-  $("cal").querySelectorAll("button").forEach((b) => b.addEventListener("click", () => {
+  html += "</div>" + (freeThisMonth ? "" : "<p class='muted'>No open days this month. Try the next one.</p>");
+  $("cal").innerHTML = html;
+  $("cal-prev").addEventListener("click", () => { st.month = shiftMonth(st.month, -1); renderCal(first, last); });
+  $("cal-next").addEventListener("click", () => { st.month = shiftMonth(st.month, 1); renderCal(first, last); });
+  $("cal").querySelectorAll("button[data-d]").forEach((b) => b.addEventListener("click", () => {
     st.date = b.dataset.d; renderCal(first, last); msg("date-msg", "Delivery: " + nice(st.date) + ", first thing in the morning.");
     const nx = new Date(st.date + "T12:00:00Z"); nx.setUTCDate(nx.getUTCDate() + 1);
     $("est").min = nx.toISOString().slice(0, 10); if ($("est").value && $("est").value < $("est").min) $("est").value = "";
@@ -743,7 +751,7 @@ loadPayPal();
 
 const CSS = `
 :root{--ink:#111;--muted:#555;--line:#ddd;--bg:#fafaf7;--card:#fff;--yellow:#f5c400;--red:#b3261e;--green:#1e7b34}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+*{box-sizing:border-box}[hidden]{display:none!important}body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
 @font-face{font-family:"Permanent Marker";src:url("/fonts/PermanentMarker-Regular.ttf") format("truetype");font-display:swap}
 .marker{font-family:"Permanent Marker",cursive;font-weight:400}
 main.narrow{max-width:640px;margin:0 auto;padding:24px 16px 64px}main.center{text-align:center;padding-top:15vh}
@@ -754,9 +762,11 @@ h1{font-size:clamp(1.8rem,6vw,2.4rem);margin:.3em 0}.lede{color:var(--muted)}
 .card.ok{border-color:var(--green)}.card h2{font-size:1.15rem;margin:0 0 10px;display:flex;align-items:center;gap:10px}
 .card h2 > span:first-child{display:inline-grid;place-items:center;width:28px;height:28px;border-radius:50%;background:var(--yellow);font-size:.95rem}
 label{display:grid;gap:4px;margin:10px 0;font-size:.95rem}label.choice{display:flex;gap:10px;align-items:baseline;cursor:pointer}
-input:not([type=radio]):not([type=checkbox]),textarea{font:inherit;padding:10px 12px;border:1px solid #bbb;border-radius:8px;width:100%;background:#fff}
+input:not([type=radio]):not([type=checkbox]),textarea,select{font:inherit;padding:10px 12px;border:1px solid #bbb;border-radius:8px;width:100%;background:#fff}
 textarea{min-height:80px}button{font:inherit;font-weight:600;padding:10px 16px;border:0;border-radius:8px;background:var(--yellow);color:var(--ink);cursor:pointer}
 .row{display:flex;gap:8px}label.off{opacity:.5}.muted,small{color:var(--muted)}.msg{min-height:1.2em;margin:6px 0 0}.msg.err{color:var(--red)}
+.calnav{display:flex;align-items:center;justify-content:space-between;margin:4px 0 8px}.calnav b{font-size:1.05rem}
+.calnav button{width:40px;height:36px;padding:0;font-size:1.4rem;line-height:1;background:#fff;border:1.5px solid var(--ink)}.calnav button:disabled{opacity:.25;cursor:default}
 .cal{display:grid;grid-template-columns:repeat(7,1fr);gap:4px;text-align:center}.cal b{font-size:.8rem;color:var(--muted)}
 .cal i{grid-column:1/-1;text-align:left;font-style:normal;font-weight:700;margin-top:8px}
 .cal button,.cal span{padding:9px 0;border-radius:8px}.cal button{background:#fff;border:1.5px solid var(--ink)}.cal button:hover{background:#fff4bf}

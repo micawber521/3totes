@@ -171,6 +171,9 @@ const MIGRATIONS = [
     `UPDATE settings SET value = 'We will text you the hub address and a time.'
       WHERE key = 'pickup_location_text' AND value = 'We will text you our Sikeston address and a time.'`,
   ]],
+  [11, [
+    `INSERT OR IGNORE INTO settings (key, value) VALUES ('booking_horizon_days', '180')`,  // how far ahead customers can book
+  ]],
 ];
 
 let ready = false;
