@@ -594,7 +594,7 @@ ${preview ? `<div class="banner">PREVIEW: online booking is OFF. Payments use th
   <section class="card" id="s-pay" hidden><h2><span>6</span> Review and pay</h2>
     <div id="summary"></div>
     <p id="pay-msg" class="msg"></p>
-    <div id="paypal"></div>
+    <div id="pp-buttons"></div>
   </section>
   </form>
 </main>
@@ -765,7 +765,7 @@ function loadPayPal() {
     },
     onCancel: () => msg("pay-msg", "Payment cancelled. Your day is held for a few minutes if you want to try again."),
     onError: () => { if (!$("pay-msg").textContent) msg("pay-msg", "PayPal had a problem. Please try again.", true); },
-  }).render("#paypal");
+  }).render("#pp-buttons");
   document.head.appendChild(s);
 }
 loadPayPal();
@@ -795,7 +795,7 @@ textarea{min-height:80px}button{font:inherit;font-weight:600;padding:10px 16px;b
 .cal button,.cal span{padding:9px 0;border-radius:8px}.cal button{background:#fff;border:1.5px solid var(--ink)}.cal button:hover{background:#fff4bf}
 .cal button.sel{background:var(--yellow)}.cal span.off{color:#bbb;text-decoration:line-through}.cal span.past{color:#ddd}
 .agreement{max-height:260px;overflow:auto;border:1px solid var(--line);border-radius:8px;padding:12px;font-size:.9rem;background:#fcfcfa}
-ul.sum{padding-left:20px;margin:6px 0}.sumh{font-size:.95rem;margin:16px 0 6px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)}.sumh:first-child{margin-top:4px}table.bill{width:100%;border-collapse:collapse}table.bill td{padding:8px 0;border-bottom:1px solid var(--line);vertical-align:top}table.bill td.amt{text-align:right;white-space:nowrap;padding-left:12px}table.bill tr.total td{border-bottom:0;border-top:2px solid var(--ink);font-weight:700;font-size:1.1rem}#paypal{margin-top:12px}
+ul.sum{padding-left:20px;margin:6px 0}.sumh{font-size:.95rem;margin:16px 0 6px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)}.sumh:first-child{margin-top:4px}table.bill{width:100%;border-collapse:collapse}table.bill td{padding:8px 0;border-bottom:1px solid var(--line);vertical-align:top}table.bill td.amt{text-align:right;white-space:nowrap;padding-left:12px}table.bill tr.total td{border-bottom:0;border-top:2px solid var(--ink);font-weight:700;font-size:1.1rem}#pp-buttons{margin-top:12px}
 .big{font-size:1.15rem}.prices .pi{padding:12px 0;border-bottom:1px solid var(--line)}.prices .pi:last-child{border-bottom:0}.pi-top{display:flex;justify-content:space-between;gap:16px;align-items:baseline}.pi-price{white-space:nowrap;font-weight:600}.pi-price small{font-weight:400}.pi-note{margin:4px 0 0;font-size:.88rem;color:var(--muted)}.center-text{text-align:center;margin-top:24px}.row input{flex:1}
 button.link{background:none;padding:0;color:#0b57d0;text-decoration:underline;font-weight:400}
 `;
