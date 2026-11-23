@@ -110,6 +110,12 @@ const MIGRATIONS = [
     `UPDATE payments SET refund_of = (SELECT p2.paypal_id FROM payments p2 WHERE p2.booking_id = payments.booking_id AND p2.kind = 'setup')
       WHERE kind = 'refund' AND refund_of IS NULL`,
   ]],
+  [5, [
+    `ALTER TABLE bookings ADD COLUMN deposit_kept_cents INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE bookings ADD COLUMN deposit_kept_reason TEXT`,
+    `ALTER TABLE bookings ADD COLUMN deposit_settled_at TEXT`,   // when the deposit was refunded/settled
+    `ALTER TABLE bookings ADD COLUMN returned_at TEXT`,          // when pickup was completed
+  ]],
 ];
 
 let ready = false;

@@ -216,7 +216,7 @@ ${myLink(b)}
 When you're done, schedule your pickup on that page. Please have the totes EMPTY and everything together.
 We pick up the empty totes and equipment; we don't move your belongings.
 
-Your deposit is refunded after pickup and a quick check of the equipment.
+Your deposit is refunded at pickup, right after a quick onsite check of the equipment.
 
 Thanks!
 Totes Totes Totes
@@ -338,6 +338,9 @@ async function myPage(env, s, token, url) {
     <p>Status: <b>${esc(MY_STATUS[b.status] || b.status)}</b></p>
     <p>Delivery: ${esc(niceDate(b.delivery_date))}, first thing in the morning<br>${esc(b.address)}, ${esc(b.zip)}</p>
     ${b.rate_recurring_cents ? `<p class="muted">${esc(planLine)}</p>` : ""}
+    <p>Refundable deposit: <b>${money(b.deposit_cents)}</b>${b.deposit_settled_at
+      ? `<br>Refunded ${money(b.deposit_refunded_cents)}${b.deposit_kept_cents ? ` (kept ${money(b.deposit_kept_cents)} for ${esc(b.deposit_kept_reason || "")})` : ""} on ${esc(niceDate(b.deposit_settled_at.slice(0, 10)))}`
+      : `<br><span class="muted">Refunded at pickup, after a quick onsite check of the equipment.</span>`}</p>
   </section>
   ${["cancelled", "returned", "closed", "pending"].includes(b.status) ? "" : `
   <section class="card"><h2>Pickup</h2>
@@ -456,6 +459,7 @@ ${preview ? `<div class="banner">PREVIEW: online booking is OFF. Payments use th
   <section class="card" id="s-plan" hidden><h2><span>2</span> Pick a plan</h2>
     <label class="choice"><input type="radio" name="plan" value="moving" checked> <b>Moving</b>: <span id="p-moving"></span></label>
     <label class="choice"><input type="radio" name="plan" value="storage"> <b>Storage</b>: <span id="p-storage"></span></label>
+    <p class="muted" id="p-deposit"></p>
   </section>
 
   <section class="card" id="s-date" hidden><h2><span>3</span> Pick your delivery day</h2>
@@ -504,6 +508,7 @@ const msg = (id, t, err) => { const e = $(id); e.textContent = t || ""; e.classN
 
 if (C.done) { $("done").hidden = false; $("f").hidden = true; return; }
 $("p-moving").textContent = money(C.movingFirst) + " for the first 2 weeks (2-week minimum), then " + money(C.movingWeekly) + "/week";
+$("p-deposit").textContent = "Plus a " + money(C.deposit) + " refundable deposit at booking, refunded at pickup after a quick check of the equipment.";
 $("p-storage").textContent = money(C.storageMonthly) + "/month, 1-month minimum (after that, unused full weeks are refunded after pickup)";
 
 $("zip").addEventListener("input", async (e) => {

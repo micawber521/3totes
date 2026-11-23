@@ -3,6 +3,7 @@
 import { adminIdentity } from "./access.js";
 import { ensureSchema, getSettings, kitConflict, newToken } from "./db.js";
 import { paypalReady, refundSale, cancelSubscription } from "./paypal.js";
+import { trySend } from "./mail.js";
 
 const TZ = "America/Chicago";
 const STATUSES = ["pending", "confirmed", "delivered", "pickup_requested", "returned", "closed", "cancelled"];
@@ -11,6 +12,10 @@ const STATUS_LABEL = {
   returned: "Returned", closed: "Closed", cancelled: "Cancelled",
 };
 const KIT_STATUSES = ["active", "cleaning", "retired"];
+const KIT_ITEMS = [
+  ["totes", "12 totes with lids"], ["truck", "Hand truck"], ["blankets", "3 moving blankets"],
+  ["hardwood", "8 hardwood sliders"], ["carpet", "8 carpet sliders"], ["lift", "Lifting strap set"], ["cam", "2 cam-buckle straps"],
+];
 const SETTING_FIELDS = [
   ["deposit_cents", "Deposit", "money"],
   ["moving_first_cents", "Moving plan, first 2 weeks", "money"],
@@ -243,6 +248,20 @@ async function bookingView(db, who, id, flash, error = "") {
   const billingOn = b.paypal_subscription_id && !["CANCELLED", "EXPIRED"].includes(b.billing_status || "");
   const online = b.source === "online";
   const rr = rentalRefundInfo(b, pays);
+  const t = today();
+  const rrToday = rentalRefundInfo({ ...b, pickup_date: t }, pays);
+  const canComplete = ["delivered", "pickup_requested"].includes(b.status);
+  const complete = canComplete ? `<section class="card complete"><h2>Complete pickup</h2>
+      <p class="muted">Do this onsite once everything is loaded. It marks the kit returned${b.paypal_subscription_id ? ", stops PayPal billing" : ""} and refunds the deposit.</p>
+      <form method="post" class="grid narrow" onsubmit="return confirm('Complete pickup and issue the refund now?')">
+        <input type="hidden" name="action" value="complete_pickup">
+        <fieldset><legend>Everything back?</legend>${KIT_ITEMS.map(([k, label]) => `<label class="check"><input type="checkbox" name="item_${k}" checked> ${esc(label)}</label>`).join("")}</fieldset>
+        <label>Keep from deposit <input name="kept" inputmode="decimal" value="0.00"></label>
+        <label>Reason <small>(required if keeping anything; the customer sees this)</small> <input name="reason" maxlength="300" placeholder="e.g. 1 cracked tote lid"></label>
+        ${b.plan === "storage" && rrToday && rrToday.suggest > 0 ? `<label class="check"><input type="checkbox" name="refund_weeks" checked> Also refund unused storage weeks: ${money(rrToday.suggest)}</label><small class="muted">${esc(rrToday.note)}</small>` : ""}
+        <p>Deposit refund: <b>${money(b.deposit_cents - b.deposit_refunded_cents)}</b> minus anything kept.</p>
+        <button type="submit">Complete pickup &amp; refund</button>
+      </form></section>` : "";
   const billing = online ? `<section class="card"><h2>PayPal</h2>
       <p>Billing: <b>${esc(b.billing_status || "unknown")}</b>${b.plan === "moving" ? ` · ${money(b.rate_first_cents)} first 2 weeks, then ${money(b.rate_recurring_cents)}/week` : ` · ${money(b.rate_recurring_cents)}/month`}
       ${b.delivery_fee_cents ? ` · delivery fee ${money(b.delivery_fee_cents)}` : ""}</p>
@@ -268,7 +287,7 @@ async function bookingView(db, who, id, flash, error = "") {
         <dt>Pickup</dt><dd>${b.pickup_date ? esc(niceDate(b.pickup_date)) : "Open-ended"}</dd>
         <dt>Est. return</dt><dd>${b.est_return_date ? esc(niceDate(b.est_return_date)) + " <small>(customer estimate)</small>" : "<span class='muted'>none</span>"}</dd>
         <dt>Customer link</dt><dd>${b.manage_token ? `<input readonly value="https://3totes.com/my/${esc(b.manage_token)}" onclick="this.select()"><br><small>Their page to schedule pickup. Send it to manual-booking customers.</small>` : ""}</dd>
-        <dt>Deposit</dt><dd>${money(b.deposit_cents)}${b.deposit_refunded_cents ? `, refunded ${money(b.deposit_refunded_cents)}` : ""}</dd>
+        <dt>Deposit</dt><dd>${money(b.deposit_cents)}${b.deposit_refunded_cents ? `, refunded ${money(b.deposit_refunded_cents)}` : ""}${b.deposit_kept_cents ? `, kept ${money(b.deposit_kept_cents)} (${esc(b.deposit_kept_reason || "")})` : ""}</dd>
         <dt>Agreement</dt><dd>${b.signed_at ? `Signed by ${esc(b.signed_name)} at ${esc(b.signed_at)}` : `Not signed online (${esc(b.agreement_version || "no version")})`}</dd>
         <dt>Source</dt><dd>${esc(b.source)}, created ${esc(b.created_at)} UTC</dd>
       </dl></section>
@@ -284,6 +303,7 @@ async function bookingView(db, who, id, flash, error = "") {
           <label>Log note <small>(added to the history)</small> <input name="log" maxlength="500"></label>
           <button type="submit">Save</button>
         </form></section>
+      ${complete}
       ${billing}
     </div>
     <h2>History</h2>
@@ -294,6 +314,7 @@ async function bookingUpdate(db, who, id, request, env) {
   const b = await db.prepare("SELECT * FROM bookings WHERE id = ?").bind(id).first();
   if (!b) return deny(404, "Not found");
   const v = await readForm(request);
+  if (v.action === "complete_pickup") return completePickup(db, who, b, v, env);
   if (["cancel_billing", "refund", "refund_rental"].includes(v.action)) return billingAction(db, who, b, v, env);
   const s = await getSettings(db);
   const fail = (msg) => bookingView(db, who, id, "", msg);
@@ -463,7 +484,9 @@ async function billingAction(db, who, b, v, env) {
       .bind(b.id, cents, r.data.id || null, r.data.state || "completed", setup.paypal_id),
   ]);
   await logEvent(db, b.id, who, "refund", `deposit refund ${money(cents)} via PayPal${cents < left ? ` (kept ${money(left - cents)})` : ""}`);
-  return back(`Refunded ${money(cents)}.`);
+  await db.prepare("UPDATE bookings SET deposit_settled_at = datetime('now') WHERE id = ?").bind(b.id).run();
+  await refundEmail(db, env, b.id, { depositRefund: cents, kept: left - cents, reason: v.reason || "" });
+  return back(`Refunded ${money(cents)}. Customer emailed.`);
 }
 
 // Storage policy (2026-11-23): the FIRST month is a minimum (no refund). For renewal months, after pickup,
@@ -491,6 +514,106 @@ function rentalRefundInfo(b, pays) {
     note = `Paid ${periodStart} for the month to ${periodEnd}; pickup ${b.pickup_date} leaves ${Math.max(0, unusedDays)} days = ${weeks} full week${weeks === 1 ? "" : "s"} × ${money(weekly)}.`;
   }
   return { saleId: last.paypal_id, left, suggest, note };
+}
+
+// ---------- complete pickup (onsite, phone-friendly) ----------
+
+async function completePickup(db, who, b, v, env) {
+  const back = (msg) => redirect(`/admin/bookings/${b.id}?msg=${encodeURIComponent(msg)}`);
+  if (!["delivered", "pickup_requested"].includes(b.status)) return back("This booking isn't out right now.");
+  const kept = toCents(v.kept || "0");
+  const reason = (v.reason || "").trim();
+  const left = b.deposit_cents - b.deposit_refunded_cents;
+  if (kept === null) return back("Keep amount must be a dollar amount.");
+  if (kept > left) return back(`You can keep at most the ${money(left)} deposit left.`);
+  if (kept > 0 && !reason) return back("Add a reason for keeping part of the deposit (the customer sees it).");
+  const missing = KIT_ITEMS.filter(([k]) => v[`item_${k}`] !== "on").map(([, label]) => label);
+  const t = today();
+  const pays = (await db.prepare("SELECT * FROM payments WHERE booking_id = ? ORDER BY id").bind(b.id).all()).results;
+  const online = Boolean(b.paypal_subscription_id);
+  if (online && !paypalReady(env)) return back("PayPal is not connected; nothing changed.");
+  const notes = [], problems = [];
+  let depositRefund = 0, weeksRefund = 0;
+  const refundCents = left - kept;
+
+  if (online) {
+    // Stop billing first so no renewal can land after the kit is back.
+    if (!["CANCELLED", "EXPIRED"].includes(b.billing_status || "")) {
+      const r = await cancelSubscription(env, b.paypal_subscription_id, `Booking ${b.id}: equipment picked up`);
+      if (r.ok || r.status === 422) {
+        await db.prepare("UPDATE bookings SET billing_status = 'CANCELLED' WHERE id = ?").bind(b.id).run();
+        notes.push("billing stopped");
+      } else problems.push(`PayPal didn't stop billing (${r.status}); use Stop billing`);
+    }
+    if (refundCents > 0) {
+      const setup = pays.find((p) => p.kind === "setup");
+      if (!setup) problems.push("deposit payment not recorded yet, so no deposit refund was sent");
+      else {
+        const r = await refundSale(env, setup.paypal_id, refundCents);
+        if (r.ok) {
+          depositRefund = refundCents;
+          await db.batch([
+            db.prepare("UPDATE bookings SET deposit_refunded_cents = deposit_refunded_cents + ? WHERE id = ?").bind(refundCents, b.id),
+            db.prepare("INSERT OR IGNORE INTO payments (booking_id, kind, amount_cents, paypal_id, status, refund_of) VALUES (?, 'refund', ?, ?, ?, ?)")
+              .bind(b.id, refundCents, r.data.id || null, r.data.state || "completed", setup.paypal_id),
+          ]);
+          notes.push(`deposit refund ${money(refundCents)}`);
+        } else problems.push(`PayPal refused the deposit refund (${r.status}); use the Refund button`);
+      }
+    }
+    const rr = rentalRefundInfo({ ...b, pickup_date: t }, pays);
+    if (v.refund_weeks === "on" && b.plan === "storage" && rr && rr.suggest > 0) {
+      const r = await refundSale(env, rr.saleId, rr.suggest);
+      if (r.ok) {
+        weeksRefund = rr.suggest;
+        await db.prepare("INSERT OR IGNORE INTO payments (booking_id, kind, amount_cents, paypal_id, status, refund_of) VALUES (?, 'refund', ?, ?, ?, ?)")
+          .bind(b.id, rr.suggest, r.data.id || null, r.data.state || "completed", rr.saleId).run();
+        notes.push(`unused weeks refund ${money(rr.suggest)}`);
+      } else problems.push(`PayPal refused the unused-weeks refund (${r.status})`);
+    }
+  } else {
+    // Manual booking: money was handled outside PayPal; just record it.
+    depositRefund = refundCents;
+    await db.prepare("UPDATE bookings SET deposit_refunded_cents = deposit_refunded_cents + ? WHERE id = ?").bind(refundCents, b.id).run();
+    notes.push(`deposit refund ${money(refundCents)} recorded (pay it back the way they paid)`);
+  }
+
+  const settled = !problems.some((p) => p.includes("deposit"));
+  await db.prepare(
+    `UPDATE bookings SET status = 'returned', pickup_date = ?, returned_at = datetime('now'), deposit_kept_cents = deposit_kept_cents + ?,
+       deposit_kept_reason = COALESCE(NULLIF(?, ''), deposit_kept_reason),
+       deposit_settled_at = CASE WHEN ? THEN datetime('now') ELSE deposit_settled_at END,
+       updated_at = datetime('now') WHERE id = ?`).bind(t, kept, reason, settled ? 1 : 0, b.id).run();
+  await logEvent(db, b.id, who, "pickup completed",
+    [missing.length ? `MISSING: ${missing.join(", ")}` : "all items back", kept ? `kept ${money(kept)}: ${reason}` : "", ...notes, ...problems]
+      .filter(Boolean).join("; "));
+  if (settled) await refundEmail(db, env, b.id, { depositRefund, kept, reason, weeksRefund, missing, pickedUp: true });
+  return back(problems.length ? `Pickup completed, but: ${problems.join("; ")}.` : `Pickup completed: ${notes.join(", ")}. Customer emailed.`);
+}
+
+async function refundEmail(db, env, id, { depositRefund = 0, kept = 0, reason = "", weeksRefund = 0, missing = [], pickedUp = false }) {
+  const b = await db.prepare("SELECT b.*, c.name, c.email FROM bookings b JOIN customers c ON c.id = b.customer_id WHERE b.id = ?").bind(id).first();
+  if (!b || !b.email) return;
+  const owner = String(env.CONTACT_EMAIL || "").trim();
+  const lines = [
+    `Hi ${b.name},`, "",
+    pickedUp ? "We picked up your totes today. Thanks for renting with us!" : "Here's an update on your deposit.", "",
+    `Deposit: ${money(b.deposit_cents)}`,
+    ...(kept ? [`Kept: ${money(kept)}${reason ? ` for ${reason}` : ""}`] : []),
+    `Refunded: ${money(depositRefund)}`,
+    ...(weeksRefund ? [`Unused storage weeks refunded: ${money(weeksRefund)}`] : []),
+    ...(missing.length ? ["", `Items we didn't get back: ${missing.join(", ")}. Please reply to this email if you still have them.`] : []),
+    "",
+    b.paypal_subscription_id
+      ? "Refunds go back to the payment method you used through PayPal. Your bank may take a few business days to show it."
+      : "We'll return your refund the same way you paid.",
+    ...(pickedUp && b.paypal_subscription_id ? ["Your rental billing has stopped."] : []),
+    "", "Questions? Just reply to this email.", "", "Totes Totes Totes", "3totes.com",
+  ];
+  await trySend(env, {
+    to: b.email, subject: pickedUp ? "Pickup complete: your deposit refund" : "Your deposit refund", text: lines.join("\n"),
+    replyTo: owner ? `<${owner}>` : undefined,
+  });
 }
 
 // ---------- zones ----------
@@ -553,6 +676,7 @@ textarea{min-height:80px}button,.button{font:inherit;font-weight:600;padding:8px
 form.filters,form.inline{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px}form.filters input{flex:1;min-width:200px}form.filters select,form.inline input{width:auto}
 .cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px}.card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:4px 16px 16px}
 dl{display:grid;grid-template-columns:max-content 1fr;gap:6px 14px;margin:0}dt{color:var(--muted)}dd{margin:0}
+label.check{display:flex;gap:8px;align-items:center}label.check input{width:auto}.card.complete{border:2px solid var(--yellow)}
 .events{list-style:none;padding:0}.events li{padding:6px 0;border-bottom:1px solid var(--line)}.events time{font-size:.8rem;color:var(--muted)}
 @media (min-width:900px){form.grid:not(.narrow){grid-template-columns:repeat(3,1fr);align-items:start}form.grid:not(.narrow)>button{grid-column:1/-1;justify-self:start}}
 @media (max-width:700px){table,thead,tbody,tr,td{display:block}thead{display:none}tr{border-bottom:2px solid var(--line)}td{border:0;padding:4px 10px}}
