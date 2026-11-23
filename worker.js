@@ -10,8 +10,9 @@
 //   SMTP_PORT            optional, default 587 (STARTTLS); 465 = implicit TLS
 //   TURNSTILE_SITE_KEY   optional: enables Cloudflare Turnstile anti-spam
 //   TURNSTILE_SECRET     optional: required if TURNSTILE_SITE_KEY is set
-import { connect } from "cloudflare:sockets";
 import { handleAdmin } from "./src/admin.js";
+import { handleBook } from "./src/book.js";
+import { sendMail, oneLine, encodeHeader } from "./src/mail.js";
 
 const ALLOWED_ORIGINS = ["https://3totes.com", "https://www.3totes.com"];
 const LIMITS = { name: 100, email: 200, message: 5000 };
@@ -20,6 +21,10 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     if (url.pathname === "/api/contact") return handleContact(request, env);
+    if (url.pathname === "/book" || url.pathname === "/book/" || url.pathname.startsWith("/api/book/") || url.pathname === "/api/paypal/webhook") {
+      try { const r = await handleBook(request, env); if (r) return r; }
+      catch (e) { console.error("book error:", e && e.stack); return Response.json({ ok: false, msg: "Something went wrong. Please try again." }, { status: 500 }); }
+    }
     if (url.pathname === "/admin" || url.pathname.startsWith("/admin/")) {
       try { return await handleAdmin(request, env); }
       catch (e) { console.error("admin error:", e && e.stack); return new Response("Something went wrong.", { status: 500 }); }
@@ -75,7 +80,14 @@ async function handleContact(request, env) {
   }
 
   try {
-    await sendMail(env, { name, email, message, ip: request.headers.get("CF-Connecting-IP") || "unknown" });
+    const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+    await sendMail(env, {
+      to: env.CONTACT_EMAIL.trim(),
+      fromName: "3totes.com contact form",
+      replyTo: `${encodeHeader(oneLine(name).replace(/[<>"]/g, ""))} <${oneLine(email)}>`,
+      subject: "3totes.com contact: " + oneLine(name),
+      text: `From: ${name} <${email}>\nIP: ${ip}\n\n${message}\n`,
+    });
   } catch (e) {
     console.error("smtp failure:", e && e.message);
     return reply(502, false, "Sorry, the message could not be sent. Please try again later.");
@@ -92,92 +104,4 @@ async function verifyTurnstile(token, secret, ip) {
   const r = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", { method: "POST", body });
   const j = await r.json().catch(() => ({}));
   return j.success === true;
-}
-
-// ---------- minimal SMTP submission client ----------
-
-const enc = new TextEncoder();
-const oneLine = (s) => s.replace(/[\r\n]+/g, " ");
-const b64 = (s) => { let bin = ""; for (const b of enc.encode(s)) bin += String.fromCharCode(b); return btoa(bin); };
-const encodeHeader = (s) => (/^[\x20-\x7e]*$/.test(s) ? s : `=?UTF-8?B?${b64(s)}?=`);
-
-function buildMessage(env, { name, email, message, ip }) {
-  const from = env.SMTP_USER.trim(), to = env.CONTACT_EMAIL.trim();
-  const body = `From: ${name} <${email}>\nIP: ${ip}\n\n${message}\n`.replace(/\r?\n/g, "\r\n");
-  const body64 = b64(body).replace(/.{1,76}/g, "$&\r\n");
-  const domain = from.split("@")[1] || "3totes.com";
-  return [
-    `From: ${encodeHeader("3totes.com contact form")} <${from}>`,
-    `To: <${to}>`,
-    `Reply-To: ${encodeHeader(oneLine(name).replace(/[<>"]/g, ""))} <${oneLine(email)}>`,
-    `Subject: ${encodeHeader("3totes.com contact: " + oneLine(name))}`,
-    `Date: ${new Date().toUTCString()}`,
-    `Message-ID: <${crypto.randomUUID()}@${domain}>`,
-    "MIME-Version: 1.0",
-    "Content-Type: text/plain; charset=utf-8",
-    "Content-Transfer-Encoding: base64",
-    "",
-    body64,
-  ].join("\r\n");
-}
-
-class Smtp {
-  constructor(socket) { this.attach(socket); }
-  attach(socket) {
-    this.socket = socket;
-    this.reader = socket.readable.getReader();
-    this.writer = socket.writable.getWriter();
-    this.buf = "";
-    this.dec = new TextDecoder();
-  }
-  async read(expect) {
-    // Read one full (possibly multi-line) reply, e.g. "250-..." lines ending with "250 ...".
-    for (;;) {
-      const lines = this.buf.split("\r\n");
-      for (let i = 0; i < lines.length - 1; i++) {
-        if (/^\d{3} /.test(lines[i])) {
-          const code = Number(lines[i].slice(0, 3));
-          this.buf = lines.slice(i + 1).join("\r\n");
-          if (code !== expect) throw new Error(`SMTP expected ${expect}, got ${lines[i].slice(0, 120)}`);
-          return;
-        }
-      }
-      const { value, done } = await this.reader.read();
-      if (done) throw new Error("SMTP connection closed");
-      this.buf += this.dec.decode(value, { stream: true });
-    }
-  }
-  async cmd(line, expect) {
-    await this.writer.write(enc.encode(line + "\r\n"));
-    await this.read(expect);
-  }
-}
-
-async function sendMail(env, fields) {
-  const user = env.SMTP_USER.trim();
-  const hostname = (env.SMTP_SERVER || "smtp.protonmail.ch").trim();
-  const port = Number((env.SMTP_PORT || "587").trim()) || 587;
-  const implicitTls = port === 465;
-  const socket = connect({ hostname, port }, { secureTransport: implicitTls ? "on" : "starttls" });
-  const s = new Smtp(socket);
-  try {
-    await s.read(220);
-    await s.cmd("EHLO 3totes.com", 250);
-    if (!implicitTls) {
-      await s.cmd("STARTTLS", 220);
-      s.reader.releaseLock();
-      s.writer.releaseLock();
-      s.attach(socket.startTls());
-      await s.cmd("EHLO 3totes.com", 250);
-    }
-    await s.cmd("AUTH PLAIN " + b64(`\u0000${user}\u0000${env.SMTP_TOKEN.trim()}`), 235);
-    await s.cmd(`MAIL FROM:<${user}>`, 250);
-    await s.cmd(`RCPT TO:<${env.CONTACT_EMAIL.trim()}>`, 250);
-    await s.cmd("DATA", 354);
-    // Body is base64, so no line can start with "." and no dot-stuffing is needed.
-    await s.cmd(buildMessage(env, fields) + "\r\n.", 250);
-    await s.cmd("QUIT", 221).catch(() => {});
-  } finally {
-    try { await s.socket.close(); } catch {}
-  }
 }

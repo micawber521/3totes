@@ -2,6 +2,7 @@
 // Step 1 of BOOKING_DESIGN: kits, manual bookings, schedule, settings. No payments yet.
 import { adminIdentity } from "./access.js";
 import { ensureSchema, getSettings, kitConflict } from "./db.js";
+import { paypalReady, refundSale, cancelSubscription } from "./paypal.js";
 
 const TZ = "America/Chicago";
 const STATUSES = ["pending", "confirmed", "delivered", "pickup_requested", "returned", "closed", "cancelled"];
@@ -16,6 +17,7 @@ const SETTING_FIELDS = [
   ["moving_weekly_cents", "Moving plan, each week after", "money"],
   ["storage_monthly_cents", "Storage plan, monthly", "money"],
   ["buffer_days", "Turnaround days between rentals", "int"],
+  ["lead_days", "Days of notice before a delivery (online)", "int"],
   ["agreement_version", "Rental agreement version", "text"],
 ];
 
@@ -32,7 +34,7 @@ const badge = (s) => `<span class="badge s-${esc(s)}">${esc(STATUS_LABEL[s] || s
 
 function page(title, who, body, flash = "") {
   const nav = who.role === "owner"
-    ? `<a href="/admin">Schedule</a><a href="/admin/bookings">Bookings</a><a href="/admin/bookings/new">New booking</a><a href="/admin/kits">Kits</a><a href="/admin/settings">Settings</a>`
+    ? `<a href="/admin">Schedule</a><a href="/admin/bookings">Bookings</a><a href="/admin/bookings/new">New booking</a><a href="/admin/kits">Kits</a><a href="/admin/zones">Zones</a><a href="/admin/settings">Settings</a>`
     : `<a href="/admin">Schedule</a>`;
   return new Response(`<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex">
@@ -77,9 +79,10 @@ export async function handleAdmin(request, env) {
   if (path === "/admin/bookings/new" && request.method === "GET") return bookingForm(db, who, {}, "");
   if (path === "/admin/bookings/new" && request.method === "POST") return bookingCreate(db, who, request);
   if (m && request.method === "GET") return bookingView(db, who, Number(m[1]), flash);
-  if (m && request.method === "POST") return bookingUpdate(db, who, Number(m[1]), request);
+  if (m && request.method === "POST") return bookingUpdate(db, who, Number(m[1]), request, env);
   if (path === "/admin/kits") return request.method === "POST" ? kitsPost(db, request) : kitsPage(db, who, flash);
-  if (path === "/admin/settings") return request.method === "POST" ? settingsPost(db, request) : settingsPage(db, who, flash);
+  if (path === "/admin/settings") return request.method === "POST" ? settingsPost(db, request) : settingsPage(db, who, flash, url, env);
+  if (path === "/admin/zones") return request.method === "POST" ? zonesPost(db, request) : zonesPage(db, who, flash);
   return deny(404, "Not found");
 }
 
@@ -230,6 +233,20 @@ async function bookingView(db, who, id, flash, error = "") {
   if (!b) return deny(404, "Not found");
   const events = (await db.prepare("SELECT * FROM booking_events WHERE booking_id = ? ORDER BY id DESC").bind(id).all()).results;
   const kits = (await db.prepare("SELECT id, label FROM kits WHERE status != 'retired' OR id = ? ORDER BY label").bind(b.kit_id).all()).results;
+  const pays = (await db.prepare("SELECT * FROM payments WHERE booking_id = ? ORDER BY id").bind(id).all()).results;
+  const setup = pays.find((p) => p.kind === "setup");
+  const refundLeft = b.deposit_cents - b.deposit_refunded_cents;
+  const billingOn = b.paypal_subscription_id && !["CANCELLED", "EXPIRED"].includes(b.billing_status || "");
+  const online = b.source === "online";
+  const billing = online ? `<section class="card"><h2>PayPal</h2>
+      <p>Billing: <b>${esc(b.billing_status || "unknown")}</b>${b.plan === "moving" ? ` · ${money(b.rate_first_cents)} first 2 weeks, then ${money(b.rate_recurring_cents)}/week` : ` · ${money(b.rate_recurring_cents)}/month`}
+      ${b.delivery_fee_cents ? ` · delivery fee ${money(b.delivery_fee_cents)}` : ""}</p>
+      ${pays.length ? `<table><thead><tr><th>When (UTC)</th><th>What</th><th>Amount</th></tr></thead><tbody>${pays.map((p) => `<tr><td>${esc(p.created_at)}</td><td>${esc({ setup: "Deposit + delivery", rental: "Rental", refund: "Refund", other: "Other" }[p.kind])}</td><td>${p.kind === "refund" ? "−" : ""}${money(p.amount_cents)}</td></tr>`).join("")}</tbody></table>` : `<p class="muted">No payments received yet.</p>`}
+      ${billingOn ? `<form method="post" class="inline" onsubmit="return confirm('Stop all future PayPal billing for this booking?')"><input type="hidden" name="action" value="cancel_billing"><button>Stop billing</button> <small class="muted">Do this when the kit is picked up.</small></form>` : ""}
+      ${setup && refundLeft > 0 ? `<form method="post" class="inline" onsubmit="return confirm('Refund this amount through PayPal?')"><input type="hidden" name="action" value="refund">
+        <label>Refund deposit <input name="amount" inputmode="decimal" value="${(refundLeft / 100).toFixed(2)}"></label><button>Refund via PayPal</button>
+        <small class="muted">Lower the amount to keep damage charges.</small></form>` : ""}
+    </section>` : "";
   return page(`Booking #${b.id}: ${b.name}`, who, `
     ${error ? `<p class="error">${esc(error)}</p>` : ""}
     <div class="cols">
@@ -256,15 +273,17 @@ async function bookingView(db, who, id, flash, error = "") {
           <label>Log note <small>(added to the history)</small> <input name="log" maxlength="500"></label>
           <button type="submit">Save</button>
         </form></section>
+      ${billing}
     </div>
     <h2>History</h2>
     ${events.length ? `<ul class="events">${events.map((e) => `<li><time>${esc(e.at)} UTC</time> <b>${esc(e.action)}</b> ${esc(e.detail || "")} <small class="muted">${esc(e.by_email || "")}</small></li>`).join("")}</ul>` : `<p class="muted">No history.</p>`}`, flash);
 }
 
-async function bookingUpdate(db, who, id, request) {
+async function bookingUpdate(db, who, id, request, env) {
   const b = await db.prepare("SELECT * FROM bookings WHERE id = ?").bind(id).first();
   if (!b) return deny(404, "Not found");
   const v = await readForm(request);
+  if (v.action === "cancel_billing" || v.action === "refund") return billingAction(db, who, b, v, env);
   const s = await getSettings(db);
   const fail = (msg) => bookingView(db, who, id, "", msg);
 
@@ -342,29 +361,118 @@ async function kitsPost(db, request) {
 
 // ---------- settings ----------
 
-async function settingsPage(db, who, flash) {
+async function settingsPage(db, who, flash, url, env) {
   const s = await getSettings(db);
+  const previewUrl = `${url.origin}/book?preview=${encodeURIComponent(s.booking_preview_key || "")}`;
   return page("Settings", who, `
+    <section class="card"><h2>Online booking</h2>
+      <form method="post" class="inline"><input type="hidden" name="section" value="booking">
+        <label>Online booking <select name="online_booking"><option value="off"${s.online_booking !== "on" ? " selected" : ""}>OFF (preview link only)</option><option value="on"${s.online_booking === "on" ? " selected" : ""}>ON (public)</option></select></label>
+        <button>Save</button></form>
+      <p>Preview link (works while OFF): <a href="${esc(previewUrl)}" target="_blank" rel="noopener">${esc(previewUrl)}</a></p>
+      <form method="post" class="inline"><input type="hidden" name="section" value="new_preview"><button>New preview link</button> <small class="muted">old link stops working</small></form>
+      <p class="muted">PayPal: ${paypalReady(env) ? "connected" : "see Worker secrets"}. Turn ON only after the agreement is lawyer-reviewed and insurance is in place.</p>
+    </section>
     <p class="muted">Prices are DRAFT until Phase 1 decisions are made. Changing them here affects new bookings only.</p>
     <form method="post" class="grid narrow">
       ${SETTING_FIELDS.map(([key, label, type]) => `<label>${esc(label)} <input name="${key}" ${type === "int" ? 'type="number" min="0" max="30"' : type === "money" ? 'inputmode="decimal"' : 'maxlength="50"'}
         value="${esc(type === "money" ? (Number(s[key] || 0) / 100).toFixed(2) : s[key] ?? "")}"></label>`).join("")}
-      <button type="submit">Save settings</button></form>`, flash);
+      <button type="submit">Save settings</button></form>
+    <h2>Rental agreement text</h2>
+    <p class="muted">Shown on the booking page; customers sign it. Change the version above whenever you change this text.</p>
+    <form method="post" class="grid"><input type="hidden" name="section" value="agreement">
+      <textarea name="agreement_text" style="min-height:360px;grid-column:1/-1">${esc(s.agreement_text || "")}</textarea>
+      <button type="submit">Save agreement</button></form>`, flash);
 }
 
 async function settingsPost(db, request) {
   const v = await readForm(request);
+  const put = (k, val) => db.prepare("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value").bind(k, val);
+  if (v.section === "booking") { await put("online_booking", v.online_booking === "on" ? "on" : "off").run(); return redirect("/admin/settings?msg=" + encodeURIComponent(`Online booking is ${v.online_booking === "on" ? "ON" : "OFF"}.`)); }
+  if (v.section === "new_preview") {
+    const key = [...crypto.getRandomValues(new Uint8Array(12))].map((x) => x.toString(16).padStart(2, "0")).join("");
+    await put("booking_preview_key", key).run(); return redirect("/admin/settings?msg=" + encodeURIComponent("New preview link created."));
+  }
+  if (v.section === "agreement") { await put("agreement_text", (v.agreement_text || "").slice(0, 50000)).run(); return redirect("/admin/settings?msg=" + encodeURIComponent("Agreement saved.")); }
   const stmts = [];
   for (const [key, , type] of SETTING_FIELDS) {
     if (!(key in v)) continue;
     let val = v[key];
     if (type === "money") { const c = toCents(val); if (c === null) return redirect("/admin/settings?msg=" + encodeURIComponent("Prices must be dollar amounts.")); val = String(c); }
-    if (type === "int") { const n = Number(val); if (!Number.isInteger(n) || n < 0 || n > 30) return redirect("/admin/settings?msg=" + encodeURIComponent("Turnaround days must be 0-30.")); val = String(n); }
+    if (type === "int") { const n = Number(val); if (!Number.isInteger(n) || n < 0 || n > 30) return redirect("/admin/settings?msg=" + encodeURIComponent("Day counts must be 0-30.")); val = String(n); }
     if (type === "text" && !val) continue;
     stmts.push(db.prepare("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value").bind(key, val));
   }
   if (stmts.length) await db.batch(stmts);
   return redirect("/admin/settings?msg=" + encodeURIComponent("Settings saved."));
+}
+
+// ---------- billing actions ----------
+
+async function billingAction(db, who, b, v, env) {
+  const back = (msg) => redirect(`/admin/bookings/${b.id}?msg=${encodeURIComponent(msg)}`);
+  if (!paypalReady(env)) return back("PayPal is not connected.");
+  if (v.action === "cancel_billing") {
+    if (!b.paypal_subscription_id) return back("No PayPal billing on this booking.");
+    const r = await cancelSubscription(env, b.paypal_subscription_id, `Booking ${b.id}: equipment picked up`);
+    if (!r.ok && r.status !== 422) return back(`PayPal refused (${r.status}). Nothing changed.`);
+    await db.prepare("UPDATE bookings SET billing_status = 'CANCELLED' WHERE id = ?").bind(b.id).run();
+    await logEvent(db, b.id, who, "billing", "billing stopped by admin");
+    return back("Billing stopped.");
+  }
+  const cents = toCents(v.amount || "");
+  const left = b.deposit_cents - b.deposit_refunded_cents;
+  if (!cents || cents <= 0) return back("Enter a refund amount.");
+  if (cents > left) return back(`Refund is more than the ${money(left)} deposit left.`);
+  const setup = await db.prepare("SELECT paypal_id FROM payments WHERE booking_id = ? AND kind = 'setup'").bind(b.id).first();
+  if (!setup) return back("The deposit payment hasn't been recorded yet, so there is nothing to refund.");
+  const r = await refundSale(env, setup.paypal_id, cents);
+  if (!r.ok) return back(`PayPal refused the refund (${r.status}). Nothing changed.`);
+  await db.batch([
+    db.prepare("UPDATE bookings SET deposit_refunded_cents = deposit_refunded_cents + ? WHERE id = ?").bind(cents, b.id),
+    db.prepare("INSERT OR IGNORE INTO payments (booking_id, kind, amount_cents, paypal_id, status) VALUES (?, 'refund', ?, ?, ?)")
+      .bind(b.id, cents, r.data.id || null, r.data.state || "completed"),
+  ]);
+  await logEvent(db, b.id, who, "refund", `deposit refund ${money(cents)} via PayPal${cents < left ? ` (kept ${money(left - cents)})` : ""}`);
+  return back(`Refunded ${money(cents)}.`);
+}
+
+// ---------- zones ----------
+
+async function zonesPage(db, who, flash) {
+  const zones = (await db.prepare("SELECT * FROM zones ORDER BY hub, zone, zip").all()).results;
+  const wait = (await db.prepare("SELECT zip, COUNT(*) n FROM waitlist GROUP BY zip ORDER BY n DESC LIMIT 20").all()).results;
+  return page("Delivery zones", who, `
+    <p class="muted">Only these zip codes can book online. Fee 0 = free delivery.</p>
+    ${zones.length ? `<table><thead><tr><th>Zip</th><th>Zone</th><th>Delivery fee</th><th>Hub</th><th></th></tr></thead><tbody>
+      ${zones.map((z) => `<tr><td>${esc(z.zip)}</td><td>${esc(z.zone)}</td><td>${money(z.delivery_fee_cents)}</td><td>${esc(z.hub)}</td>
+        <td><form method="post" onsubmit="return confirm('Remove ${esc(z.zip)}?')"><input type="hidden" name="action" value="delete"><input type="hidden" name="zip" value="${esc(z.zip)}"><button>Remove</button></form></td></tr>`).join("")}
+      </tbody></table>` : `<p class="error">No zip codes yet: nobody can book online until you add some.</p>`}
+    <h2>Add or update zip codes</h2>
+    <form method="post" class="inline"><input type="hidden" name="action" value="add">
+      <input name="zips" placeholder="63801, 63834 ..." required style="min-width:260px">
+      <input name="zone" placeholder="Zone (e.g. Sikeston local)" required maxlength="50">
+      <input name="fee" placeholder="Fee $" inputmode="decimal" value="0" style="width:90px">
+      <select name="hub"><option value="sikeston">Sikeston</option><option value="jackson">Jackson</option></select>
+      <button>Save</button></form>
+    <h2>Waitlist</h2>
+    ${wait.length ? `<ul>${wait.map((w) => `<li>${esc(w.zip || "no zip")}: ${w.n} ${w.n === 1 ? "person" : "people"}</li>`).join("")}</ul>` : `<p class="muted">Nobody yet.</p>`}`, flash);
+}
+
+async function zonesPost(db, request) {
+  const v = await readForm(request);
+  const back = (m) => redirect("/admin/zones?msg=" + encodeURIComponent(m));
+  if (v.action === "delete") { await db.prepare("DELETE FROM zones WHERE zip = ?").bind(v.zip || "").run(); return back(`Removed ${v.zip}.`); }
+  const zips = [...new Set((v.zips || "").split(/[\s,]+/).filter(Boolean))];
+  if (!zips.length || zips.some((z) => !/^\d{5}$/.test(z))) return back("Zip codes must be 5 digits, separated by commas or spaces.");
+  const fee = toCents(v.fee || "0");
+  if (fee === null) return back("Fee must be a dollar amount.");
+  if (!v.zone) return back("Give the zone a name.");
+  const hub = v.hub === "jackson" ? "jackson" : "sikeston";
+  await db.batch(zips.map((z) => db.prepare(
+    "INSERT INTO zones (zip, zone, delivery_fee_cents, hub) VALUES (?, ?, ?, ?) ON CONFLICT (zip) DO UPDATE SET zone = excluded.zone, delivery_fee_cents = excluded.delivery_fee_cents, hub = excluded.hub")
+    .bind(z, v.zone.slice(0, 50), fee, hub)));
+  return back(`Saved ${zips.length} zip code${zips.length === 1 ? "" : "s"}.`);
 }
 
 // ---------- styles ----------

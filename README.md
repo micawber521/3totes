@@ -46,3 +46,13 @@ Add: (1) Zero Trust > Access controls > Applications > 3totes app > Policies > `
 (2) Worker > Settings > Variables and Secrets > `OWNER_EMAILS` (full access) or `DRIVER_EMAILS` (schedule only),
 comma-separated. Remove: take the email out of both; to cut access immediately, also revoke the user's session in
 Zero Trust > My Team > Users. Users log in with any email (no Cloudflare or Proton account needed).
+
+## Online booking (`/book`) + PayPal
+- `src/book.js`: customer flow (zip check → plan → available day → details → agreement signature → PayPal),
+  plus the PayPal webhook at `/api/paypal/webhook`. Hidden while the admin setting **Online booking** is OFF;
+  the preview link on the admin Settings page works anyway (for testing).
+- `src/paypal.js`: one PayPal subscription per booking, priced from admin Settings at booking time.
+  Setup fee = deposit + delivery fee (charged at approval); rental billing starts the delivery morning.
+- `src/mail.js`: Proton SMTP, shared by the contact form and booking emails.
+- Secrets: `PAYPAL_CLIENT_ID`, `PAYPAL_SECRET`, `PAYPAL_WEBHOOK_ID`; set `PAYPAL_ENV` = `live` only for production.
+- `keep_vars: true` in wrangler.json so deploys never wipe dashboard variables.

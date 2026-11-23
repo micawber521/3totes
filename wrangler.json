@@ -23,5 +23,6 @@
       "database_name": "3totes",
       "database_id": "c5092e09-3507-47db-b050-a7e1ba8d7f97"
     }
-  ]
+  ],
+  "keep_vars": true
 }
