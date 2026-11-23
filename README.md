@@ -40,3 +40,9 @@ Setup (Cloudflare dashboard):
 | `ACCESS_AUD` | Access application's Audience (AUD) tag |
 | `OWNER_EMAILS` | comma-separated, full admin |
 | `DRIVER_EMAILS` | optional, comma-separated, schedule only |
+
+### Adding / removing an admin user (login = email PIN via Cloudflare Access one-time PIN)
+Add: (1) Zero Trust > Access controls > Applications > 3totes app > Policies > `Allowed_Emails` > add the email;
+(2) Worker > Settings > Variables and Secrets > `OWNER_EMAILS` (full access) or `DRIVER_EMAILS` (schedule only),
+comma-separated. Remove: take the email out of both; to cut access immediately, also revoke the user's session in
+Zero Trust > My Team > Users. Users log in with any email (no Cloudflare or Proton account needed).
