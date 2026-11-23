@@ -1,7 +1,7 @@
 // Customer online booking (/book) + PayPal webhook.
 // Hidden behind the `online_booking` setting; while off, /book?preview=<booking_preview_key> still works
 // so Christian can test end to end (sandbox).
-import { ensureSchema, getSettings, kitBlocks, freeKit, kitConflict, newToken, addonPacksAvailable, ADDON_PACK_SIZE, HUBS, hubName } from "./db.js";
+import { ensureSchema, getSettings, kitBlocks, freeKit, kitConflict, newToken, addonPacksAvailable, addonState, packsFree, ADDON_PACK_SIZE, HUBS, hubName } from "./db.js";
 import { paypalReady, createRentalSubscription, getSubscription, verifyWebhook, firstRenewalDate } from "./paypal.js";
 import { trySend } from "./mail.js";
 import { cancelFee, customerCanCancel, cancelBooking, cancelPolicyText } from "./cancel.js";
@@ -40,14 +40,16 @@ function rates(s, plan, packs = 0) {
 }
 const isSelf = (b) => b.fulfillment === "self";
 
-async function availableDates(db, s, plan) {
+async function availableDates(db, s, plan, packs = 0) {
   const lead = Math.max(1, Number(s.lead_days) || 1); // drop-off is first thing in the morning → never same day
   const horizon = Math.min(400, Math.max(30, Number(s.booking_horizon_days) || 180));
   const first = addDays(today(), lead), last = addDays(today(), horizon);
   const state = await kitBlocks(db, s.buffer_days);
+  const extras = packs > 0 ? await addonState(db, s) : null;
   const out = [];
   for (let d = first; d <= last; d = addDays(d, 1)) {
-    if (freeKit(state, d, addDays(d, WINDOW_DAYS[plan] - 1))) out.push(d);
+    const end = addDays(d, WINDOW_DAYS[plan] - 1);
+    if (freeKit(state, d, end) && (!extras || packsFree(extras, d, end) >= packs)) out.push(d);
   }
   return { first, last, dates: out };
 }
@@ -80,13 +82,13 @@ export async function handleBook(request, env) {
   if (p === "/api/book/zip" && request.method === "GET") return zipCheck(env.DB, url);
   if (p === "/api/book/dates" && request.method === "GET") {
     const plan = url.searchParams.get("plan") === "storage" ? "storage" : "moving";
-    return json(200, { ok: true, plan, ...(await availableDates(env.DB, s, plan)) });
+    const packs = Math.max(0, Math.min(10, parseInt(url.searchParams.get("addons") || "0", 10) || 0));
+    return json(200, { ok: true, plan, ...(await availableDates(env.DB, s, plan, packs)) });
   }
   if (p === "/api/book/addons" && request.method === "GET") {
     const plan = url.searchParams.get("plan") === "storage" ? "storage" : "moving";
-    const date = url.searchParams.get("date") || "";
-    if (!isDate(date)) return json(400, { ok: false, msg: "Pick a day first." });
-    const max = await addonPacksAvailable(env.DB, s, date, addDays(date, WINDOW_DAYS[plan] - 1));
+    // Step 2 (before a date is picked): offer up to the total pool; the calendar then hides days without enough free.
+    const max = (await addonState(env.DB, s)).pool;
     const a = addonRates(s, plan);
     return json(200, { ok: true, max: Math.min(max, 10), packSize: ADDON_PACK_SIZE, first: a.first, recurring: a.recurring });
   }
@@ -137,7 +139,7 @@ async function start(request, env, s, url) {
   if (b.agree !== true || v.signed_name.length < 2) return json(400, { ok: false, msg: "Please read the rental agreement, check the box and type your name to sign." });
   if (!s.agreement_text && s.online_booking === "on") return json(503, { ok: false, msg: "Booking is temporarily unavailable." });
 
-  const { dates } = await availableDates(db, s, v.plan);
+  const { dates } = await availableDates(db, s, v.plan, packs);
   if (!dates.includes(v.date)) return json(409, { ok: false, msg: "Sorry, that day was just taken. Please pick another day.", refresh: true });
 
   const r = rates(s, v.plan, packs);
@@ -494,13 +496,17 @@ async function myAction(request, env, s, token, action) {
 
 async function pricesPage(db) {
   const items = (await db.prepare("SELECT * FROM price_items WHERE active = 1 ORDER BY sort, name").all()).results;
-  const rows = items.map((i) => `<tr><td><b>${esc(i.name)}</b>${i.note ? `<br><small>${esc(i.note)}</small>` : ""}</td>
-    <td class="num">${money(i.price_cents)}${i.pack_size > 1 ? ` per pack of ${i.pack_size}<br><small>Any missing or damaged piece means the whole pack is replaced.</small>` : i.kind === "item" ? " each" : ""}</td></tr>`).join("");
+  const unit = (i) => i.pack_size > 1 ? `per pack of ${i.pack_size}` : i.kind === "item" ? "each" : "per pickup";
+  const rows = items.map((i) => {
+    const notes = [i.note, i.pack_size > 1 ? "Any missing or damaged piece means the whole pack is replaced." : ""].filter(Boolean);
+    return `<div class="pi"><div class="pi-top"><b>${esc(i.name)}</b><span class="pi-price">${money(i.price_cents)} <small>${unit(i)}</small></span></div>
+      ${notes.length ? `<p class="pi-note">${notes.map(esc).join(" ")}</p>` : ""}</div>`;
+  }).join("");
   return new Response(`${PAGE_HEAD("Replacement prices | Totes Totes Totes")}<main class="narrow">
   <a href="/" class="home"><img src="/logo.svg" alt="Totes Totes Totes" class="logo small"></a>
   <h1 class="marker">Replacement prices</h1>
   <p class="lede">If something in your kit comes back missing, damaged or overly dirty, these charges come out of your deposit at pickup. Normal wear like light scuffs is fine.</p>
-  <div class="card"><table class="prices">${rows}</table></div>
+  <div class="card prices">${rows}</div>
   <p class="muted">Prices may change without notice. Charges above the deposit are billed separately.</p>
   <p class="muted center-text"><a href="/book">Book your totes</a> · <a href="/#contact">Contact us</a></p>
 </main></body></html>`, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
@@ -554,6 +560,12 @@ ${preview ? `<div class="banner">PREVIEW: online booking is OFF. Payments use th
   <section class="card" id="s-plan" hidden><h2><span>2</span> Pick a plan</h2>
     <label class="choice"><input type="radio" name="plan" value="moving" checked> <span><b>Moving:</b> <span id="p-moving"></span></span></label>
     <label class="choice"><input type="radio" name="plan" value="storage"> <span><b>Storage:</b> <span id="p-storage"></span></span></label>
+    <div id="addon-wrap" hidden>
+      <label id="addon-pick">Need more totes? <small id="addon-note"></small>
+        <select id="addons"><option value="0">No extra totes</option></select></label>
+      <p id="addon-none" class="muted" hidden>Need more totes? Extra totes aren't available online right now.
+        <a href="/#contact" target="_blank" rel="noopener">Contact us</a> and we may be able to add some.</p>
+    </div>
     <p class="muted" id="p-deposit"></p>
   </section>
 
@@ -562,12 +574,6 @@ ${preview ? `<div class="banner">PREVIEW: online booking is OFF. Payments use th
     <div id="cal"></div><p id="date-msg" class="msg"></p>
     <label id="est-wrap" hidden>When do you think you'll be done? <small>(optional estimate, you can change it later)</small>
       <input id="est" type="date"></label>
-    <div id="addon-wrap" hidden>
-      <label id="addon-pick">Need more totes? <small id="addon-note"></small>
-        <select id="addons"><option value="0">No extra totes</option></select></label>
-      <p id="addon-none" class="muted" hidden>Need more totes? Extra totes aren't available online for these dates.
-        <a href="/#contact" target="_blank" rel="noopener">Contact us</a> and we may be able to add some.</p>
-    </div>
   </section>
 
   <section class="card" id="s-info" hidden><h2><span>4</span> Your details</h2>
@@ -634,7 +640,7 @@ function setFul() {
   $("date-title").textContent = st.ful === "self" ? "Pick the day you'll get the kit" : "Pick your delivery day";
   $("hub-wrap").hidden = st.ful !== "self";
   $("date-note").textContent = st.ful === "self" ? "We'll text you the hub address and a time. Keep the totes as long as you need." : "We drop off first thing in the morning. Keep the totes as long as you need.";
-  show("s-plan"); show("s-date"); if (!st.dates.length) loadDates(); summary();
+  show("s-plan"); show("s-date"); if (!st.addon) { loadAddons().then(loadDates); } else if (!st.dates.length) loadDates(); summary();
 }
 document.querySelectorAll("input[name=ful]").forEach((r) => r.addEventListener("change", setFul));
 $("wait-btn").addEventListener("click", async () => {
@@ -642,16 +648,18 @@ $("wait-btn").addEventListener("click", async () => {
     body: JSON.stringify({ email: $("wait-email").value, zip: $("zip").value }) }).then((r) => r.json()).catch(() => ({}));
   $("wait").innerHTML = "<p>" + (r.msg || "Something went wrong.") + "</p>";
 });
-document.querySelectorAll("input[name=plan]").forEach((r) => r.addEventListener("change", () => { st.plan = r.value; st.date = ""; $("addons").value = "0"; $("addon-wrap").hidden = true; loadDates(); summary(); }));
+document.querySelectorAll("input[name=plan]").forEach((r) => r.addEventListener("change", async () => { st.plan = r.value; st.date = ""; await loadAddons(); loadDates(); summary(); }));
 
 async function loadDates() {
   $("cal").innerHTML = "<p class='muted'>Loading available days...</p>";
-  const r = await fetch(api("dates", "plan=" + st.plan)).then((r) => r.json()).catch(() => ({}));
+  const r = await fetch(api("dates", "plan=" + st.plan + "&addons=" + (Number($("addons").value) || 0))).then((r) => r.json()).catch(() => ({}));
   if (!r.ok) { $("cal").innerHTML = ""; return msg("date-msg", r.msg || "Couldn't load dates.", true); }
   st.dates = r.dates; st.first = r.first; st.last = r.last;
   const startFrom = st.date || r.dates[0] || r.first; st.month = startFrom.slice(0, 7);
   renderCal(r.first, r.last);
-  if (!r.dates.length) msg("date-msg", "Sorry, every kit is booked right now. Please check back soon.", true); else msg("date-msg", "");
+  if (st.date && !r.dates.includes(st.date)) { st.date = ""; summary(); }
+  if (!r.dates.length) msg("date-msg", Number($("addons").value) ? "No open days with that many extra totes. Try fewer extra totes." : "Sorry, every kit is booked right now. Please check back soon.", true);
+  else if (!st.date) msg("date-msg", "");
 }
 // One month at a time, with arrows; only days a kit is free are clickable.
 function shiftMonth(ym, n) { const d = new Date(ym + "-01T12:00:00Z"); d.setUTCMonth(d.getUTCMonth() + n); return d.toISOString().slice(0, 7); }
@@ -676,12 +684,12 @@ function renderCal(first, last) {
     st.date = b.dataset.d; renderCal(first, last); msg("date-msg", "Delivery: " + nice(st.date) + ", first thing in the morning.");
     const nx = new Date(st.date + "T12:00:00Z"); nx.setUTCDate(nx.getUTCDate() + 1);
     $("est").min = nx.toISOString().slice(0, 10); if ($("est").value && $("est").value < $("est").min) $("est").value = "";
-    $("est-wrap").hidden = false; loadAddons();
+    $("est-wrap").hidden = false;
     show("s-info"); show("s-sign"); show("s-pay"); summary();
   }));
 }
 async function loadAddons() {
-  const r = await fetch(api("addons", "plan=" + st.plan + "&date=" + st.date)).then((r) => r.json()).catch(() => ({}));
+  const r = await fetch(api("addons", "plan=" + st.plan)).then((r) => r.json()).catch(() => ({}));
   if (!r.ok) return;
   st.addon = r; const sel = $("addons"), keep = Math.min(Number(sel.value) || 0, r.max);
   sel.innerHTML = "<option value='0'>No extra totes</option>" + Array.from({ length: r.max }, (_, i) => i + 1)
@@ -690,7 +698,7 @@ async function loadAddons() {
   $("addon-note").textContent = "packs of " + r.packSize + ": " + money(r.first) + (st.plan === "moving" ? " first 2 weeks, then " + money(r.recurring) + "/week" : "/month") + " per pack";
   $("addon-wrap").hidden = false; $("addon-pick").hidden = r.max === 0; $("addon-none").hidden = r.max > 0; summary();
 }
-$("addons").addEventListener("change", summary);
+$("addons").addEventListener("change", () => { loadDates(); summary(); });
 function summary() {
   if (!st.date) { $("summary").innerHTML = ""; return; }
   const moving = st.plan === "moving", packs = Number($("addons").value) || 0, a = st.addon || { first: 0, recurring: 0, packSize: 4 };
@@ -732,7 +740,7 @@ function loadPayPal() {
     createSubscription: async () => {
       const r = await fetch(api("start"), { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(form()) })
         .then((r) => r.json()).catch(() => ({ ok: false }));
-      if (!r.ok) { msg("pay-msg", r.msg || "Something went wrong.", true); if (r.refresh) loadDates(); if (r.refreshAddons) loadAddons(); throw new Error("start failed"); }
+      if (!r.ok) { msg("pay-msg", r.msg || "Something went wrong.", true); if (r.refresh) loadDates(); if (r.refreshAddons) { loadAddons(); loadDates(); } throw new Error("start failed"); }
       booking = r; return r.subscriptionId;
     },
     onApprove: async (data) => {
@@ -775,6 +783,6 @@ textarea{min-height:80px}button{font:inherit;font-weight:600;padding:10px 16px;b
 .cal button.sel{background:var(--yellow)}.cal span.off{color:#bbb;text-decoration:line-through}.cal span.past{color:#ddd}
 .agreement{max-height:260px;overflow:auto;border:1px solid var(--line);border-radius:8px;padding:12px;font-size:.9rem;background:#fcfcfa}
 ul.sum{padding-left:20px}#paypal{margin-top:12px}
-.big{font-size:1.15rem}table.prices{width:100%;border-collapse:collapse}table.prices td{padding:10px 4px;border-bottom:1px solid var(--line);vertical-align:top}table.prices td.num{text-align:right;white-space:nowrap}.center-text{text-align:center;margin-top:24px}.row input{flex:1}
+.big{font-size:1.15rem}.prices .pi{padding:12px 0;border-bottom:1px solid var(--line)}.prices .pi:last-child{border-bottom:0}.pi-top{display:flex;justify-content:space-between;gap:16px;align-items:baseline}.pi-price{white-space:nowrap;font-weight:600}.pi-price small{font-weight:400}.pi-note{margin:4px 0 0;font-size:.88rem;color:var(--muted)}.center-text{text-align:center;margin-top:24px}.row input{flex:1}
 button.link{background:none;padding:0;color:#0b57d0;text-decoration:underline;font-weight:400}
 `;

@@ -260,3 +260,18 @@ export async function addonPacksAvailable(db, s, start, end, excludeId = 0) {
 
 export const HUBS = { sikeston: "Sikeston", jackson: "Jackson" };
 export const hubName = (k) => HUBS[k] || "our";
+
+// In-memory version for the calendar: one query, then check every day cheaply.
+export async function addonState(db, s) {
+  const buf = `+${Number(s.buffer_days) || 0} days`;
+  const borrowed = await db.prepare("SELECT COALESCE(SUM(totes_borrowed), 0) AS n FROM kits WHERE status != 'retired'").first();
+  const { results } = await db.prepare(
+    `SELECT delivery_date AS start, CASE WHEN pickup_date IS NULL THEN NULL ELSE date(pickup_date, ?1) END AS end, addon_packs AS packs
+       FROM bookings WHERE status != 'cancelled' AND addon_packs > 0
+        AND NOT (status = 'pending' AND hold_expires_at IS NOT NULL AND hold_expires_at < datetime('now'))`).bind(buf).all();
+  return { pool: Math.floor(((Number(s.spare_totes) || 0) + borrowed.n) / ADDON_PACK_SIZE), blocks: results };
+}
+export function packsFree({ pool, blocks }, start, end) {
+  const used = blocks.filter((b) => (b.end === null || b.end >= start) && (end === null || b.start <= end)).reduce((a, b) => a + b.packs, 0);
+  return Math.max(0, pool - used);
+}
