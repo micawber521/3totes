@@ -563,8 +563,10 @@ ${preview ? `<div class="banner">PREVIEW: online booking is OFF. Payments use th
     <label id="est-wrap" hidden>When do you think you'll be done? <small>(optional estimate, you can change it later)</small>
       <input id="est" type="date"></label>
     <div id="addon-wrap" hidden>
-      <label>Need more totes? <small id="addon-note"></small>
+      <label id="addon-pick">Need more totes? <small id="addon-note"></small>
         <select id="addons"><option value="0">No extra totes</option></select></label>
+      <p id="addon-none" class="muted" hidden>Need more totes? Extra totes aren't available online for these dates.
+        <a href="/#contact" target="_blank" rel="noopener">Contact us</a> and we may be able to add some.</p>
     </div>
   </section>
 
@@ -686,7 +688,7 @@ async function loadAddons() {
     .map((n) => "<option value='" + n + "'>" + (n * r.packSize) + " extra totes (" + n + " pack" + (n > 1 ? "s" : "") + ")</option>").join("");
   sel.value = String(keep);
   $("addon-note").textContent = "packs of " + r.packSize + ": " + money(r.first) + (st.plan === "moving" ? " first 2 weeks, then " + money(r.recurring) + "/week" : "/month") + " per pack";
-  $("addon-wrap").hidden = r.max === 0 && keep === 0; summary();
+  $("addon-wrap").hidden = false; $("addon-pick").hidden = r.max === 0; $("addon-none").hidden = r.max > 0; summary();
 }
 $("addons").addEventListener("change", summary);
 function summary() {
