@@ -143,7 +143,7 @@ async function start(request, env, s, url) {
   if (!dates.includes(v.date)) return json(409, { ok: false, msg: "Sorry, that day was just taken. Please pick another day.", refresh: true });
 
   const r = rates(s, v.plan, packs);
-  const deposit = Number(s.deposit_cents) || 0;
+  const deposit = (Number(s.deposit_cents) || 0) + packs * (Number(s.deposit_per_pack_cents) || 0);
   const windowEnd = addDays(v.date, WINDOW_DAYS[v.plan] - 1);
   if (packs > 0 && packs > await addonPacksAvailable(db, s, v.date, windowEnd))
     return json(409, { ok: false, msg: "Sorry, we don't have that many extra totes for those dates. Please pick fewer.", refreshAddons: true });
@@ -532,7 +532,7 @@ function bookPage(env, s, url) {
   const cfg = {
     clientId: String(env.PAYPAL_CLIENT_ID || "").trim(),
     preview: preview ? url.searchParams.get("preview") : "",
-    deposit: Number(s.deposit_cents), movingFirst: Number(s.moving_first_cents), movingWeekly: Number(s.moving_weekly_cents),
+    deposit: Number(s.deposit_cents), depositPerPack: Number(s.deposit_per_pack_cents) || 0, movingFirst: Number(s.moving_first_cents), movingWeekly: Number(s.moving_weekly_cents),
     storageMonthly: Number(s.storage_monthly_cents), done: url.searchParams.get("done") === "1", cancelText: cancelPolicyText(s),
   };
   return new Response(`${PAGE_HEAD("Book your totes | Totes Totes Totes")}
@@ -616,7 +616,7 @@ const msg = (id, t, err) => { const e = $(id); e.textContent = t || ""; e.classN
 
 if (C.done) { $("done").hidden = false; $("f").hidden = true; return; }
 $("p-moving").textContent = money(C.movingFirst) + " for the first 2 weeks (2-week minimum), then " + money(C.movingWeekly) + "/week";
-$("p-deposit").textContent = "Plus a " + money(C.deposit) + " refundable deposit at booking, refunded at pickup after a quick check of the equipment.";
+$("p-deposit").textContent = "Plus a " + money(C.deposit) + " refundable deposit at booking" + (C.depositPerPack ? " (" + money(C.depositPerPack) + " more per extra tote pack)" : "") + ", refunded at pickup after a quick check of the equipment.";
 $("p-storage").textContent = money(C.storageMonthly) + "/month, 1-month minimum (after that, unused full weeks are refunded after pickup)";
 
 $("zip").addEventListener("input", async (e) => {
@@ -705,8 +705,9 @@ function summary() {
   const first = (moving ? C.movingFirst : C.storageMonthly) + packs * a.first, recurring = (moving ? C.movingWeekly : C.storageMonthly) + packs * a.recurring;
   const ren = new Date(st.date + "T12:00:00Z"); if (moving) ren.setUTCDate(ren.getUTCDate() + 14); else ren.setUTCMonth(ren.getUTCMonth() + 1);
   const renDate = ren.toISOString().slice(0, 10);
-  $("summary").innerHTML = "<ul class='sum'><li><b>Today: " + money(C.deposit + first + st.fee) + "</b><ul>" +
-    "<li>" + money(C.deposit) + " refundable deposit (back at pickup)</li>" +
+  const dep = C.deposit + packs * C.depositPerPack;
+  $("summary").innerHTML = "<ul class='sum'><li><b>Today: " + money(dep + first + st.fee) + "</b><ul>" +
+    "<li>" + money(dep) + " refundable deposit (back at pickup)" + (packs && C.depositPerPack ? ", includes " + money(packs * C.depositPerPack) + " for extra totes" : "") + "</li>" +
     "<li>" + money(first) + (moving ? " first 2 weeks (2-week minimum)" : " first month (1-month minimum)") + (packs ? ", including " + packs * a.packSize + " extra totes" : "") + "</li>" +
     (st.fee ? "<li>" + money(st.fee) + " delivery</li>" : "") + "</ul></li>" +
     "<li>Your rental time starts " + (st.ful === "self" ? "when you pick up the kit on " : "when we deliver on ") + nice(st.date) + ".</li>" +

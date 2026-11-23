@@ -174,6 +174,9 @@ const MIGRATIONS = [
   [11, [
     `INSERT OR IGNORE INTO settings (key, value) VALUES ('booking_horizon_days', '180')`,  // how far ahead customers can book
   ]],
+  [12, [
+    `INSERT OR IGNORE INTO settings (key, value) VALUES ('deposit_per_pack_cents', '2000')`,  // added to the deposit per extra tote pack
+  ]],
 ];
 
 let ready = false;

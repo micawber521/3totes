@@ -19,6 +19,7 @@ const lineCharge = (it, qty) => qty > 0 ? Math.ceil(qty / Math.max(1, it.pack_si
 const packNote = (it) => it.pack_size > 1 ? `pack of ${it.pack_size}: any missing = whole pack` : "";
 const SETTING_FIELDS = [
   ["deposit_cents", "Deposit", "money"],
+  ["deposit_per_pack_cents", "Deposit added per extra tote pack", "money"],
   ["moving_first_cents", "Moving plan, first 2 weeks", "money"],
   ["moving_weekly_cents", "Moving plan, each week after", "money"],
   ["storage_monthly_cents", "Storage plan, monthly", "money"],
@@ -198,7 +199,7 @@ async function bookingForm(db, who, v, error) {
         <label>Hub <small>(customer pickup/return)</small> <select name="hub">${Object.entries(HUBS).map(([k, n]) => `<option value="${k}"${v.hub === k ? " selected" : ""}>${esc(n)}</option>`).join("")}</select></label>
         <label>Extra totes <small>(packs of ${ADDON_PACK_SIZE})</small> <input name="addon_packs" type="number" min="0" max="10" value="${esc(v.addon_packs || "0")}"></label>
         <label>Kit <select name="kit_id">${kits.map((k) => `<option value="${k.id}"${String(k.id) === String(v.kit_id) ? " selected" : ""}>${esc(k.label)}${k.status === "cleaning" ? " (cleaning)" : ""}</option>`).join("")}</select></label>
-        <label>Deposit <input name="deposit" inputmode="decimal" value="${esc(v.deposit ?? (Number(s.deposit_cents || 0) / 100).toFixed(2))}"></label>
+        <label>Deposit <small>(base; ${money(s.deposit_per_pack_cents)} per extra tote pack is added automatically)</small> <input name="deposit" inputmode="decimal" value="${esc(v.deposit ?? (Number(s.deposit_cents || 0) / 100).toFixed(2))}"></label>
         <label>Status <select name="status"><option value="confirmed">Confirmed</option><option value="pending"${v.status === "pending" ? " selected" : ""}>Pending</option></select></label>
         <label>Notes <textarea name="notes" maxlength="2000" placeholder="Gate code, stairs, where to leave the kit...">${esc(v.notes)}</textarea></label>
       </fieldset>
@@ -235,6 +236,7 @@ async function bookingCreate(db, who, request) {
   if (!Number.isInteger(packs) || packs < 0 || packs > 10) return fail("Extra tote packs must be 0-10.");
   if (packs && packs > await addonPacksAvailable(db, s, v.delivery_date, v.pickup_date || null)) return fail("Not enough spare totes for those dates (check Spare totes in Settings).");
   const self = v.fulfillment === "self";
+  const depositTotal = deposit + packs * (Number(s.deposit_per_pack_cents) || 0);
 
   const clash = await kitConflict(db, { kitId: kit.id, start: v.delivery_date, end: v.pickup_date || null, bufferDays: s.buffer_days });
   if (clash) return fail(`${kit.label} is already booked by ${clash.name} (#${clash.id}) from ${niceDate(clash.delivery_date)}${clash.pickup_date ? ` to ${niceDate(clash.pickup_date)}` : " (open-ended)"}, plus ${s.buffer_days} turnaround day(s).`);
@@ -251,7 +253,7 @@ async function bookingCreate(db, who, request) {
     `INSERT INTO bookings (customer_id, kit_id, plan, status, address, zip, delivery_date, pickup_date, notes, deposit_cents, agreement_version, source,
        est_return_date, manage_token, fulfillment, addon_packs, return_method, hub)
      VALUES (?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), ?, ?, 'admin', NULLIF(?, ''), ?, ?, ?, ?, ?) RETURNING id`)
-    .bind(customer.id, kit.id, v.plan, status, v.address, v.zip, v.delivery_date, v.pickup_date || "", v.notes || "", deposit, s.agreement_version || null,
+    .bind(customer.id, kit.id, v.plan, status, v.address, v.zip, v.delivery_date, v.pickup_date || "", v.notes || "", depositTotal, s.agreement_version || null,
       v.est_return_date || "", newToken(), self ? "self" : "delivery", packs, self ? "dropoff" : "pickup", self ? (HUBS[v.hub] ? v.hub : "sikeston") : null).first();
   await logEvent(db, b.id, who, "created", `${v.plan}, ${kit.label}, delivery ${v.delivery_date}`);
   return redirect(`/admin/bookings/${b.id}?msg=${encodeURIComponent("Booking created.")}`);
