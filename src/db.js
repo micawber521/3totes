@@ -161,6 +161,11 @@ const MIGRATIONS = [
        ('addon_storage_monthly_cents', '2000'),
        ('pickup_location_text', 'We will text you our Sikeston address and a time.')`,
   ]],
+  [9, [
+    // Totes taken out of a kit for extra-tote orders: the kit can't be rented while > 0,
+    // and those totes join the extra-tote pool automatically.
+    `ALTER TABLE kits ADD COLUMN totes_borrowed INTEGER NOT NULL DEFAULT 0`,
+  ]],
 ];
 
 let ready = false;
@@ -210,7 +215,7 @@ export async function kitConflict(db, { kitId, start, end, bufferDays, excludeId
 // Blocks per kit for the public calendar: [{kitId, start, end|null}] with buffer already added to end.
 export async function kitBlocks(db, bufferDays) {
   const buf = `+${Number(bufferDays) || 0} days`;
-  const kits = (await db.prepare("SELECT id FROM kits WHERE status = 'active' ORDER BY label").all()).results.map((k) => k.id);
+  const kits = (await db.prepare("SELECT id FROM kits WHERE status = 'active' AND totes_borrowed = 0 ORDER BY label").all()).results.map((k) => k.id);
   const { results } = await db.prepare(
     `SELECT kit_id, delivery_date AS start, CASE WHEN pickup_date IS NULL THEN NULL ELSE date(pickup_date, ?1) END AS end
        FROM bookings
@@ -241,5 +246,6 @@ export async function addonPacksAvailable(db, s, start, end, excludeId = 0) {
         AND NOT (status = 'pending' AND hold_expires_at IS NOT NULL AND hold_expires_at < datetime('now'))
         AND (pickup_date IS NULL OR date(pickup_date, ?2) >= ?3)
         AND (?4 IS NULL OR delivery_date <= date(?4, ?2))`).bind(excludeId, buf, start, end).first();
-  return Math.max(0, Math.floor((Number(s.spare_totes) || 0) / ADDON_PACK_SIZE) - row.n);
+  const borrowed = await db.prepare("SELECT COALESCE(SUM(totes_borrowed), 0) AS n FROM kits WHERE status != 'retired'").first();
+  return Math.max(0, Math.floor(((Number(s.spare_totes) || 0) + borrowed.n) / ADDON_PACK_SIZE) - row.n);
 }
