@@ -1,0 +1,113 @@
+// D1 schema + migrations. The Worker applies pending migrations itself on the first
+// admin request after a deploy, so no wrangler login is needed to set up the database.
+// Each migration is a list of single statements (run together in one D1 batch = one transaction).
+// Never edit a released migration; add a new one.
+
+const MIGRATIONS = [
+  [1, [
+    `CREATE TABLE IF NOT EXISTS kits (
+       id INTEGER PRIMARY KEY,
+       label TEXT NOT NULL UNIQUE,
+       status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','cleaning','retired')),
+       notes TEXT,
+       created_at TEXT NOT NULL DEFAULT (datetime('now'))
+     )`,
+    `CREATE TABLE IF NOT EXISTS customers (
+       id INTEGER PRIMARY KEY,
+       name TEXT NOT NULL,
+       email TEXT,
+       phone TEXT,
+       created_at TEXT NOT NULL DEFAULT (datetime('now'))
+     )`,
+    `CREATE INDEX IF NOT EXISTS customers_email ON customers (email)`,
+    `CREATE TABLE IF NOT EXISTS bookings (
+       id INTEGER PRIMARY KEY,
+       customer_id INTEGER NOT NULL REFERENCES customers (id),
+       kit_id INTEGER NOT NULL REFERENCES kits (id),
+       plan TEXT NOT NULL CHECK (plan IN ('moving','storage')),
+       status TEXT NOT NULL DEFAULT 'confirmed'
+         CHECK (status IN ('pending','confirmed','delivered','pickup_requested','returned','closed','cancelled')),
+       address TEXT NOT NULL,
+       zip TEXT NOT NULL,
+       delivery_date TEXT NOT NULL,        -- YYYY-MM-DD; drop-off is first thing that morning
+       pickup_date TEXT,                   -- NULL = open-ended
+       notes TEXT,
+       discount_code TEXT,
+       agreement_version TEXT,
+       signed_name TEXT,
+       signed_at TEXT,
+       signed_ip TEXT,
+       paypal_order_id TEXT,
+       paypal_subscription_id TEXT,
+       deposit_cents INTEGER NOT NULL DEFAULT 0,
+       deposit_refunded_cents INTEGER NOT NULL DEFAULT 0,
+       source TEXT NOT NULL DEFAULT 'admin' CHECK (source IN ('admin','online')),
+       created_at TEXT NOT NULL DEFAULT (datetime('now')),
+       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+     )`,
+    `CREATE INDEX IF NOT EXISTS bookings_kit ON bookings (kit_id, delivery_date)`,
+    `CREATE INDEX IF NOT EXISTS bookings_status ON bookings (status)`,
+    `CREATE TABLE IF NOT EXISTS booking_events (
+       id INTEGER PRIMARY KEY,
+       booking_id INTEGER NOT NULL REFERENCES bookings (id),
+       at TEXT NOT NULL DEFAULT (datetime('now')),
+       by_email TEXT,
+       action TEXT NOT NULL,
+       detail TEXT
+     )`,
+    `CREATE INDEX IF NOT EXISTS booking_events_booking ON booking_events (booking_id)`,
+    `CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
+    `INSERT OR IGNORE INTO kits (label, notes) VALUES ('K01', 'First kit, built 2026-11-23')`,
+    // DRAFT prices from the 2026-11-06 planning session; edit on the Settings page.
+    `INSERT OR IGNORE INTO settings (key, value) VALUES
+       ('deposit_cents', '10000'),
+       ('moving_first_cents', '6500'),
+       ('moving_weekly_cents', '2000'),
+       ('storage_monthly_cents', '10000'),
+       ('buffer_days', '1'),
+       ('agreement_version', 'draft-2026-11-23')`,
+  ]],
+];
+
+let ready = false;
+
+export async function ensureSchema(db) {
+  if (ready) return;
+  await db.prepare(
+    "CREATE TABLE IF NOT EXISTS _migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT (datetime('now')))"
+  ).run();
+  const row = await db.prepare("SELECT COALESCE(MAX(version), 0) AS v FROM _migrations").first();
+  for (const [version, stmts] of MIGRATIONS) {
+    if (version <= row.v) continue;
+    try {
+      await db.batch([
+        ...stmts.map((s) => db.prepare(s)),
+        db.prepare("INSERT INTO _migrations (version) VALUES (?)").bind(version),
+      ]);
+    } catch (e) {
+      // Another isolate may have applied it at the same moment; only rethrow if it is still missing.
+      const done = await db.prepare("SELECT 1 FROM _migrations WHERE version = ?").bind(version).first();
+      if (!done) throw e;
+    }
+  }
+  ready = true;
+}
+
+export async function getSettings(db) {
+  const { results } = await db.prepare("SELECT key, value FROM settings").all();
+  return Object.fromEntries(results.map((r) => [r.key, r.value]));
+}
+
+// Does kitId have another booking that overlaps [start, end]? end = null means open-ended.
+// A booking blocks its kit from delivery_date through pickup_date + buffer days (cleaning/turnaround).
+export async function kitConflict(db, { kitId, start, end, bufferDays, excludeId = 0 }) {
+  const buf = `+${Number(bufferDays) || 0} days`;
+  return db.prepare(
+    `SELECT b.id, b.delivery_date, b.pickup_date, c.name
+       FROM bookings b JOIN customers c ON c.id = b.customer_id
+      WHERE b.kit_id = ?1 AND b.id != ?2 AND b.status != 'cancelled'
+        AND (b.pickup_date IS NULL OR date(b.pickup_date, ?3) >= ?4)
+        AND (?5 IS NULL OR b.delivery_date <= date(?5, ?3))
+      LIMIT 1`
+  ).bind(kitId, excludeId, buf, start, end).first();
+}

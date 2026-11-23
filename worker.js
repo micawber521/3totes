@@ -11,6 +11,7 @@
 //   TURNSTILE_SITE_KEY   optional: enables Cloudflare Turnstile anti-spam
 //   TURNSTILE_SECRET     optional: required if TURNSTILE_SITE_KEY is set
 import { connect } from "cloudflare:sockets";
+import { handleAdmin } from "./src/admin.js";
 
 const ALLOWED_ORIGINS = ["https://3totes.com", "https://www.3totes.com"];
 const LIMITS = { name: 100, email: 200, message: 5000 };
@@ -19,6 +20,10 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     if (url.pathname === "/api/contact") return handleContact(request, env);
+    if (url.pathname === "/admin" || url.pathname.startsWith("/admin/")) {
+      try { return await handleAdmin(request, env); }
+      catch (e) { console.error("admin error:", e && e.stack); return new Response("Something went wrong.", { status: 500 }); }
+    }
 
     const res = await env.ASSETS.fetch(request);
     if (!(res.headers.get("content-type") || "").includes("text/html")) return res;

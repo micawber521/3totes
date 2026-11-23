@@ -22,3 +22,21 @@ This repo is PUBLIC: never commit an email address, token or key.
 
 Deploys automatically on push to `main` (Cloudflare Workers Builds: build `npm run build`, deploy `npx wrangler deploy`).
 - `public/logo.svg`: hand-drawn SVG, three stacked totes.
+
+## Admin (`/admin`) — booking back office, step 1
+- `src/admin.js`: schedule, bookings (manual entry), kits, settings. Server-rendered, no payments yet.
+- `src/db.js`: D1 schema. The Worker applies pending migrations itself on the first admin request.
+- `src/access.js`: verifies the Cloudflare Access JWT inside the Worker. **Fails closed:** with no
+  Access config the admin returns 503; any other auth problem returns 403.
+
+Setup (Cloudflare dashboard):
+1. D1 database named `3totes`, bound to this Worker as `DB` (binding in `wrangler.json`).
+2. Zero Trust > Access > Applications: self-hosted app for `3totes.com/admin*`, Allow policy by email.
+3. Worker secrets:
+
+| Name | Purpose |
+|---|---|
+| `ACCESS_TEAM_DOMAIN` | e.g. `yourteam.cloudflareaccess.com` |
+| `ACCESS_AUD` | Access application's Audience (AUD) tag |
+| `OWNER_EMAILS` | comma-separated, full admin |
+| `DRIVER_EMAILS` | optional, comma-separated, schedule only |
