@@ -4,6 +4,7 @@ import { adminIdentity } from "./access.js";
 import { ensureSchema, getSettings, kitConflict, newToken } from "./db.js";
 import { paypalReady, refundSale, cancelSubscription } from "./paypal.js";
 import { trySend } from "./mail.js";
+import { cancelFee, cancelBooking } from "./cancel.js";
 
 const TZ = "America/Chicago";
 const STATUSES = ["pending", "confirmed", "delivered", "pickup_requested", "returned", "closed", "cancelled"];
@@ -23,6 +24,9 @@ const SETTING_FIELDS = [
   ["storage_monthly_cents", "Storage plan, monthly", "money"],
   ["buffer_days", "Turnaround days between rentals", "int"],
   ["lead_days", "Days of notice before a delivery (online)", "int"],
+  ["cancel_fee_early_cents", "Cancellation fee, early", "money"],
+  ["cancel_fee_late_cents", "Cancellation fee, late", "money"],
+  ["cancel_cutoff_days", "Early = at least this many days before delivery", "int"],
   ["agreement_version", "Rental agreement version", "text"],
 ];
 
@@ -249,6 +253,7 @@ async function bookingView(db, who, id, flash, error = "") {
   const online = b.source === "online";
   const rr = rentalRefundInfo(b, pays);
   const t = today();
+  const sAll = await getSettings(db);
   const rrToday = rentalRefundInfo({ ...b, pickup_date: t }, pays);
   const canComplete = ["delivered", "pickup_requested"].includes(b.status);
   const complete = canComplete ? `<section class="card complete"><h2>Complete pickup</h2>
@@ -265,7 +270,7 @@ async function bookingView(db, who, id, flash, error = "") {
   const billing = online ? `<section class="card"><h2>PayPal</h2>
       <p>Billing: <b>${esc(b.billing_status || "unknown")}</b>${b.plan === "moving" ? ` · ${money(b.rate_first_cents)} first 2 weeks, then ${money(b.rate_recurring_cents)}/week` : ` · ${money(b.rate_recurring_cents)}/month`}
       ${b.delivery_fee_cents ? ` · delivery fee ${money(b.delivery_fee_cents)}` : ""}</p>
-      ${pays.length ? `<table><thead><tr><th>When (UTC)</th><th>What</th><th>Amount</th></tr></thead><tbody>${pays.map((p) => `<tr><td>${esc(p.created_at)}</td><td>${esc({ setup: "Deposit + delivery", rental: "Rental", refund: "Refund", other: "Other" }[p.kind])}</td><td>${p.kind === "refund" ? "−" : ""}${money(p.amount_cents)}</td></tr>`).join("")}</tbody></table>` : `<p class="muted">No payments received yet.</p>`}
+      ${pays.length ? `<table><thead><tr><th>When (UTC)</th><th>What</th><th>Amount</th></tr></thead><tbody>${pays.map((p) => `<tr><td>${esc(p.created_at)}</td><td>${esc({ setup: "Paid at booking", rental: "Rental renewal", refund: "Refund", other: "Other" }[p.kind])}</td><td>${p.kind === "refund" ? "−" : ""}${money(p.amount_cents)}</td></tr>`).join("")}</tbody></table>` : `<p class="muted">No payments received yet.</p>`}
       ${billingOn ? `<form method="post" class="inline" onsubmit="return confirm('Stop all future PayPal billing for this booking?')"><input type="hidden" name="action" value="cancel_billing"><button>Stop billing</button> <small class="muted">Do this when the kit is picked up.</small></form>` : ""}
       ${setup && refundLeft > 0 ? `<form method="post" class="inline" onsubmit="return confirm('Refund this amount through PayPal?')"><input type="hidden" name="action" value="refund">
         <label>Refund deposit <input name="amount" inputmode="decimal" value="${(refundLeft / 100).toFixed(2)}"></label><button>Refund via PayPal</button>
@@ -304,6 +309,10 @@ async function bookingView(db, who, id, flash, error = "") {
           <button type="submit">Save</button>
         </form></section>
       ${complete}
+      ${["pending", "confirmed"].includes(b.status) && b.paypal_subscription_id ? (() => { const c = cancelFee(sAll, b.delivery_date, t); return `<section class="card"><h2>Cancel booking</h2>
+        <p class="muted">${c.days} day${c.days === 1 ? "" : "s"} before delivery → ${c.early ? "early" : "late"} fee. Refunds everything else paid at booking and stops billing.</p>
+        <form method="post" class="inline" onsubmit="return confirm('Cancel this booking and refund now?')"><input type="hidden" name="action" value="cancel_booking">
+          <label>Fee <input name="fee" inputmode="decimal" value="${(c.fee / 100).toFixed(2)}"></label><button>Cancel &amp; refund</button></form></section>`; })() : ""}
       ${billing}
     </div>
     <h2>History</h2>
@@ -315,6 +324,15 @@ async function bookingUpdate(db, who, id, request, env) {
   if (!b) return deny(404, "Not found");
   const v = await readForm(request);
   if (v.action === "complete_pickup") return completePickup(db, who, b, v, env);
+  if (v.action === "cancel_booking") {
+    const back = (msg) => redirect(`/admin/bookings/${id}?msg=${encodeURIComponent(msg)}`);
+    if (!["pending", "confirmed"].includes(b.status)) return back("Only bookings that haven't been delivered can be cancelled here.");
+    const fee = toCents(v.fee || "0");
+    if (fee === null) return back("Fee must be a dollar amount.");
+    const cust = await db.prepare("SELECT name, email FROM customers WHERE id = ?").bind(b.customer_id).first();
+    const r = await cancelBooking(env, db, { ...b, ...cust }, { fee, by: who.email });
+    return back(r.ok ? `Cancelled. Fee ${money(fee)}, refunded ${money(r.refunded || 0)}. Customer emailed.` : r.msg);
+  }
   if (["cancel_billing", "refund", "refund_rental"].includes(v.action)) return billingAction(db, who, b, v, env);
   const s = await getSettings(db);
   const fail = (msg) => bookingView(db, who, id, "", msg);
@@ -500,9 +518,8 @@ function rentalRefundInfo(b, pays) {
   const left = last.amount_cents - refunded;
   if (left <= 0) return null;
   let suggest = 0, note = b.plan === "moving" ? "Moving plan: 2-week minimum, partial weeks aren't refunded." : "Set a pickup date to calculate unused weeks.";
-  if (b.plan === "storage" && rentals.length === 1) {
-    note = "First month is a minimum charge: no refund (policy). Edit the amount only to make an exception.";
-  } else if (b.plan === "storage" && b.pickup_date) {
+  // The first period is paid at booking (setup sale), so every "rental" payment here is a renewal.
+  if (b.plan === "storage" && b.pickup_date) {
     const paid = new Date(last.created_at.replace(" ", "T") + "Z");
     const periodStart = paid.toLocaleDateString("en-CA", { timeZone: TZ });
     const d = new Date(periodStart + "T12:00:00Z"); d.setUTCMonth(d.getUTCMonth() + 1);

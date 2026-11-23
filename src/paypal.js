@@ -4,10 +4,10 @@
 //
 // Money model (verified against sandbox 2026-11-23): one subscription per booking, built from the
 // current admin settings at booking time:
-//   setup fee  = deposit + delivery fee, charged at approval (fails → subscription cancelled)
-//   moving     = TRIAL cycle 2 weeks at moving_first, then REGULAR weekly at moving_weekly
-//   storage    = REGULAR monthly at storage_monthly
-//   start_time = delivery day morning, so rental billing starts when the kit arrives.
+//   setup fee  = deposit + first rental period + delivery fee, charged at approval (fails → subscription cancelled)
+//   moving     = REGULAR weekly at moving_weekly, first renewal 14 days after delivery
+//   storage    = REGULAR monthly at storage_monthly, first renewal 1 month after delivery
+// (Policy 2026-11-23: pay the first period at booking; the rental clock still starts at delivery.)
 
 export const paypalReady = (env) => Boolean(env.PAYPAL_CLIENT_ID && env.PAYPAL_SECRET);
 const base = (env) => (String(env.PAYPAL_ENV || "").trim() === "live" ? "https://api-m.paypal.com" : "https://api-m.sandbox.paypal.com");
@@ -53,15 +53,18 @@ async function productId(env, db) {
 }
 
 // Creates the per-booking plan + subscription. Returns { planId, subscriptionId }.
-export async function createRentalSubscription(env, db, { bookingId, plan, firstCents, recurringCents, setupCents, deliveryDate, customerName, origin }) {
-  const cycles = plan === "moving"
-    ? [
-        { tenure_type: "TRIAL", sequence: 1, total_cycles: 1, frequency: { interval_unit: "WEEK", interval_count: 2 }, pricing_scheme: { fixed_price: usd(firstCents) } },
-        { tenure_type: "REGULAR", sequence: 2, total_cycles: 0, frequency: { interval_unit: "WEEK", interval_count: 1 }, pricing_scheme: { fixed_price: usd(recurringCents) } },
-      ]
-    : [
-        { tenure_type: "REGULAR", sequence: 1, total_cycles: 0, frequency: { interval_unit: "MONTH", interval_count: 1 }, pricing_scheme: { fixed_price: usd(recurringCents) } },
-      ];
+export function firstRenewalDate(plan, deliveryDate) {
+  const d = new Date(deliveryDate + "T12:00:00Z");
+  if (plan === "moving") d.setUTCDate(d.getUTCDate() + 14); else d.setUTCMonth(d.getUTCMonth() + 1);
+  return d.toISOString().slice(0, 10);
+}
+
+export async function createRentalSubscription(env, db, { bookingId, plan, recurringCents, setupCents, deliveryDate, origin }) {
+  const cycles = [{
+    tenure_type: "REGULAR", sequence: 1, total_cycles: 0,
+    frequency: plan === "moving" ? { interval_unit: "WEEK", interval_count: 1 } : { interval_unit: "MONTH", interval_count: 1 },
+    pricing_scheme: { fixed_price: usd(recurringCents) },
+  }];
   const p = await paypal(env, "POST", "/v1/billing/plans", {
     product_id: await productId(env, db),
     name: `Booking #${bookingId} (${plan})`,
@@ -71,11 +74,11 @@ export async function createRentalSubscription(env, db, { bookingId, plan, first
   });
   if (!p.ok) throw new Error("paypal plan create failed");
 
-  // Delivery morning (~8am Central). PayPal requires a future start; same-day is not offered.
-  const start = `${deliveryDate}T14:00:00Z`;
+  // First renewal, morning (~8am Central); always in the future because delivery is at least tomorrow.
+  const start = `${firstRenewalDate(plan, deliveryDate)}T14:00:00Z`;
   const s = await paypal(env, "POST", "/v1/billing/subscriptions", {
     plan_id: p.data.id,
-    start_time: new Date(start) > new Date(Date.now() + 60_000) ? start : undefined,
+    start_time: start,
     custom_id: String(bookingId),
     application_context: {
       brand_name: "Totes Totes Totes", shipping_preference: "NO_SHIPPING", user_action: "SUBSCRIBE_NOW",

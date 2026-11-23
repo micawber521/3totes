@@ -116,6 +116,12 @@ const MIGRATIONS = [
     `ALTER TABLE bookings ADD COLUMN deposit_settled_at TEXT`,   // when the deposit was refunded/settled
     `ALTER TABLE bookings ADD COLUMN returned_at TEXT`,          // when pickup was completed
   ]],
+  [6, [
+    `INSERT OR IGNORE INTO settings (key, value) VALUES
+       ('cancel_fee_early_cents', '1000'),
+       ('cancel_fee_late_cents', '2500'),
+       ('cancel_cutoff_days', '5')`,
+  ]],
 ];
 
 let ready = false;

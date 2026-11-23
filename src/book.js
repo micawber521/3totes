@@ -2,8 +2,9 @@
 // Hidden behind the `online_booking` setting; while off, /book?preview=<booking_preview_key> still works
 // so Christian can test end to end (sandbox).
 import { ensureSchema, getSettings, kitBlocks, freeKit, kitConflict, newToken } from "./db.js";
-import { paypalReady, createRentalSubscription, getSubscription, verifyWebhook } from "./paypal.js";
+import { paypalReady, createRentalSubscription, getSubscription, verifyWebhook, firstRenewalDate } from "./paypal.js";
 import { trySend } from "./mail.js";
+import { cancelFee, customerCanCancel, cancelBooking, cancelPolicyText } from "./cancel.js";
 
 const TZ = "America/Chicago";
 const HOLD_MINUTES = 30;
@@ -55,7 +56,7 @@ export async function handleBook(request, env) {
   if (p === "/book" && request.method === "GET") return access(s, url) ? bookPage(env, s, url) : comingSoon();
   const my = p.match(/^\/my\/([0-9a-f]{48})$/);
   if (my && request.method === "GET") return myPage(env, s, my[1], url);
-  const myApi = p.match(/^\/api\/my\/([0-9a-f]{48})\/(pickup|estimate|cancel_pickup)$/);
+  const myApi = p.match(/^\/api\/my\/([0-9a-f]{48})\/(pickup|estimate|cancel_pickup|cancel_booking)$/);
   if (myApi && request.method === "POST") {
     if (!["https://3totes.com", "https://www.3totes.com", url.origin].includes(request.headers.get("Origin") || "")) return json(403, { ok: false, msg: "Forbidden" });
     return myAction(request, env, s, myApi[1], myApi[2]);
@@ -147,8 +148,8 @@ async function start(request, env, s, url) {
   let sub;
   try {
     sub = await createRentalSubscription(env, db, {
-      bookingId: booking.id, plan: v.plan, firstCents: r.first, recurringCents: r.recurring,
-      setupCents: deposit + zone.delivery_fee_cents, deliveryDate: v.date, customerName: v.name, origin: url.origin,
+      bookingId: booking.id, plan: v.plan, recurringCents: r.recurring,
+      setupCents: deposit + r.first + zone.delivery_fee_cents, deliveryDate: v.date, origin: url.origin,
     });
   } catch (e) {
     console.error("start booking:", e && e.message);
@@ -205,8 +206,10 @@ DELIVERY: ${niceDate(b.delivery_date)}, first thing in the morning
 ADDRESS: ${b.address}, ${b.zip}${b.est_return_date ? `\nYOUR ESTIMATED PICKUP: ${niceDate(b.est_return_date)} (just an estimate, change it anytime)` : ""}
 
 ${planLine}
-Rental billing starts on your delivery day and renews automatically through PayPal.
-Paid today: ${money(b.deposit_cents)} refundable deposit${b.delivery_fee_cents ? ` + ${money(b.delivery_fee_cents)} delivery` : ""}.
+Paid today: ${money(b.deposit_cents + b.rate_first_cents + b.delivery_fee_cents)} = ${money(b.deposit_cents)} refundable deposit + ${money(b.rate_first_cents)} ${b.plan === "moving" ? "first 2 weeks" : "first month"}${b.delivery_fee_cents ? ` + ${money(b.delivery_fee_cents)} delivery` : ""}.
+Your rental time starts on delivery day. If you still have the kit after ${b.plan === "moving" ? "2 weeks" : "1 month"}, PayPal renews it automatically starting ${niceDate(firstRenewalDate(b.plan, b.delivery_date))}.
+
+CANCELLING: ${cancelPolicyText(await getSettings(env.DB))} Cancel from your booking page below.
 
 YOUR KIT: 12 totes with lids, a hand truck, moving blankets, furniture sliders, lifting straps and load straps.
 
@@ -273,10 +276,10 @@ async function handleEvent(env, ev) {
     if (!b) return;
     const cents = Math.round(Number((r.amount && r.amount.total) || 0) * 100);
     const hasSetup = await db.prepare("SELECT 1 FROM payments WHERE booking_id = ? AND kind = 'setup'").bind(b.id).first();
-    const kind = !hasSetup && cents === b.deposit_cents + b.delivery_fee_cents ? "setup" : "rental";
+    const kind = hasSetup ? "rental" : "setup"; // the first sale on a subscription is the booking payment (setup fee)
     await db.prepare("INSERT OR IGNORE INTO payments (booking_id, kind, amount_cents, paypal_id, status) VALUES (?, ?, ?, ?, ?)")
       .bind(b.id, kind, cents, r.id, r.state || "completed").run();
-    await log(b.id, "payment", `${kind === "setup" ? "deposit + delivery" : "rental"} ${money(cents)} received`);
+    await log(b.id, "payment", `${kind === "setup" ? "booking payment (deposit + first period + delivery)" : "rental renewal"} ${money(cents)} received`);
     return;
   }
   if (type.startsWith("BILLING.SUBSCRIPTION.")) {
@@ -357,6 +360,12 @@ async function myPage(env, s, token, url) {
     <p class="muted">Not sure yet? Tell us roughly when you'll be done so we can plan. It doesn't schedule anything.</p>
     <form id="est" class="row"><input type="date" id="est-date" min="${addDays(b.delivery_date, 1)}" max="${max}" value="${esc(b.est_return_date || "")}"><button>Save estimate</button></form>
     <p id="est-msg" class="msg"></p></section>`}`}
+  ${customerCanCancel(b, today()) ? (() => { const c = cancelFee(s, b.delivery_date, today()); return `
+  <section class="card"><h2>Need to cancel?</h2>
+    <p class="muted">${esc(cancelPolicyText(s))}</p>
+    <p>Cancelling today: <b>${money(c.fee)} fee</b>. You get the rest back.</p>
+    <button type="button" id="cancel-booking" data-fee="${money(c.fee)}">Cancel my booking</button>
+    <p id="cancel-msg" class="msg"></p></section>`; })() : ""}
   <p class="muted center-text">Questions? <a href="/#contact">Contact us</a>.</p>
 </main>
 <script>
@@ -368,6 +377,7 @@ async function myPage(env, s, token, url) {
   $("pick") && $("pick").addEventListener("submit", (e) => { e.preventDefault(); post("pickup", { date: $("pick-date").value }, "pick-msg"); });
   $("unpick") && $("unpick").addEventListener("click", () => { if (confirm("Cancel your pickup request?")) post("cancel_pickup", {}, "pick-msg"); });
   $("est") && $("est").addEventListener("submit", (e) => { e.preventDefault(); post("estimate", { date: $("est-date").value }, "est-msg"); });
+  $("cancel-booking") && $("cancel-booking").addEventListener("click", (e) => { if (confirm("Cancel your booking? The cancellation fee is " + e.target.dataset.fee + ".")) post("cancel_booking", {}, "cancel-msg"); });
 })();
 </script></body></html>`, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "x-robots-tag": "noindex", "referrer-policy": "no-referrer" } });
 }
@@ -380,6 +390,13 @@ async function myAction(request, env, s, token, action) {
   const date = String(body.date || "").trim();
   const log = (act, detail) => db.prepare("INSERT INTO booking_events (booking_id, by_email, action, detail) VALUES (?, ?, ?, ?)").bind(b.id, b.email || "customer", act, detail).run();
   const owner = ownerEmail(env);
+
+  if (action === "cancel_booking") {
+    if (!customerCanCancel(b, today())) return json(409, { ok: false, msg: "This booking can't be cancelled online anymore. Please contact us." });
+    const { fee } = cancelFee(s, b.delivery_date, today());
+    const r = await cancelBooking(env, db, b, { fee, by: b.email || "customer" });
+    return json(r.ok ? 200 : 502, { ok: r.ok, msg: r.msg });
+  }
 
   if (action === "estimate") {
     if (b.pickup_date) return json(400, { ok: false, msg: "Your pickup is already scheduled." });
@@ -437,7 +454,7 @@ function bookPage(env, s, url) {
     clientId: String(env.PAYPAL_CLIENT_ID || "").trim(),
     preview: preview ? url.searchParams.get("preview") : "",
     deposit: Number(s.deposit_cents), movingFirst: Number(s.moving_first_cents), movingWeekly: Number(s.moving_weekly_cents),
-    storageMonthly: Number(s.storage_monthly_cents), done: url.searchParams.get("done") === "1",
+    storageMonthly: Number(s.storage_monthly_cents), done: url.searchParams.get("done") === "1", cancelText: cancelPolicyText(s),
   };
   return new Response(`${PAGE_HEAD("Book your totes | Totes Totes Totes")}
 ${preview ? `<div class="banner">PREVIEW: online booking is OFF. Payments use the PayPal ${String(env.PAYPAL_ENV || "").trim() === "live" ? "<b>LIVE</b>" : "sandbox"}.</div>` : ""}
@@ -560,12 +577,18 @@ function renderCal(first, last) {
 }
 function summary() {
   if (!st.date) { $("summary").innerHTML = ""; return; }
-  const plan = st.plan === "moving"
-    ? "<li>On " + nice(st.date) + ": " + money(C.movingFirst) + " (first 2 weeks, 2-week minimum)</li><li>Then " + money(C.movingWeekly) + " every week until pickup</li>"
-    : "<li>On " + nice(st.date) + ": " + money(C.storageMonthly) + " (first month, 1-month minimum)</li><li>Then " + money(C.storageMonthly) + " every month until pickup</li>";
-  $("summary").innerHTML = "<ul class='sum'><li><b>Today: " + money(C.deposit + st.fee) + "</b> (" + money(C.deposit) + " refundable deposit" +
-    (st.fee ? " + " + money(st.fee) + " delivery" : "") + ")</li>" + plan + "</ul><p class='muted'>Billing stops when we pick up." +
-    (st.plan === "storage" ? " After the first month, unused full weeks of your last month are refunded." : " Partial weeks aren't refunded.") + "</p>";
+  const moving = st.plan === "moving", first = moving ? C.movingFirst : C.storageMonthly;
+  const ren = new Date(st.date + "T12:00:00Z"); if (moving) ren.setUTCDate(ren.getUTCDate() + 14); else ren.setUTCMonth(ren.getUTCMonth() + 1);
+  const renDate = ren.toISOString().slice(0, 10);
+  $("summary").innerHTML = "<ul class='sum'><li><b>Today: " + money(C.deposit + first + st.fee) + "</b><ul>" +
+    "<li>" + money(C.deposit) + " refundable deposit (back at pickup)</li>" +
+    "<li>" + money(first) + (moving ? " first 2 weeks (2-week minimum)" : " first month (1-month minimum)") + "</li>" +
+    (st.fee ? "<li>" + money(st.fee) + " delivery</li>" : "") + "</ul></li>" +
+    "<li>Your rental time starts when we deliver on " + nice(st.date) + ".</li>" +
+    "<li>Still have it after " + (moving ? "2 weeks" : "1 month") + "? " + money(moving ? C.movingWeekly : C.storageMonthly) + (moving ? " per week" : " per month") +
+    ", starting " + nice(renDate) + ", until pickup.</li></ul>" +
+    "<p class='muted'>" + (moving ? "Partial weeks aren't refunded." : "After the first month, unused full weeks of your last month are refunded.") +
+    " Cancel before delivery: " + C.cancelText + "</p>";
 }
 function form() {
   return { zip: st.zip, plan: st.plan, date: st.date, est_return: $("est").value, name: $("name").value, phone: $("phone").value, email: $("email").value,
