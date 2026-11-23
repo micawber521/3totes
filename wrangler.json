@@ -8,7 +8,20 @@
     "run_worker_first": true
   },
   "routes": [
-    { "pattern": "3totes.com", "custom_domain": true },
-    { "pattern": "www.3totes.com", "custom_domain": true }
+    {
+      "pattern": "3totes.com",
+      "custom_domain": true
+    },
+    {
+      "pattern": "www.3totes.com",
+      "custom_domain": true
+    }
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "3totes",
+      "database_id": "c5092e09-3507-47db-b050-a7e1ba8d7f97"
+    }
   ]
 }
