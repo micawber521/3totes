@@ -420,7 +420,7 @@ async function kitsPage(db, who, flash) {
       return `<tr>
         <td><b>${esc(k.label)}</b></td>
         <td><select name="location" form="${f}">${allHubs().map((h) => `<option value="${esc(h.key)}"${h.key === k.location ? " selected" : ""}>${esc(h.name)}</option>`).join("")}</select></td>
-        <td>${k.out_with ? `Out: <a href="/admin/bookings/${esc(bid)}">${esc(bname)}</a>${k.back ? `<br><small>back ${k.back.startsWith("~") ? "~" + esc(niceDate(k.back.slice(1))) + " (estimate)" : esc(niceDate(k.back))}</small>` : "<br><small>no return date</small>"}` : k.status === "retired" ? "Retired" : k.totes_borrowed ? `<b class="owed">Split for extra totes</b><br><small>not rentable</small>` : "Home"}</td>
+        <td>${k.out_with ? `Rented: <a href="/admin/bookings/${esc(bid)}">${esc(bname)}</a>${k.back ? `<br><small>back ${k.back.startsWith("~") ? "~" + esc(niceDate(k.back.slice(1))) + " (estimate)" : esc(niceDate(k.back))}</small>` : "<br><small>no return date</small>"}` : k.status === "retired" ? "Retired" : k.totes_borrowed ? `<b class="owed">Split for extra totes</b><br><small>not rentable</small>` : "Available"}</td>
         <td>${k.next_drop ? esc(niceDate(k.next_drop)) : "<span class='muted'>none</span>"}</td>
         <td><select name="status" form="${f}">${KIT_STATUSES.map((s) => `<option${s === k.status ? " selected" : ""}>${s}</option>`).join("")}</select></td>
         <td><input type="hidden" name="split_present" value="1" form="${f}"><label class="check"><input type="checkbox" name="split" form="${f}"${k.totes_borrowed ? " checked" : ""}> split</label></td>
@@ -838,7 +838,7 @@ tr.today td{background:#fff8d6}tr.late td{background:#fde8e6}
 form.grid{display:grid;gap:12px}form.grid.narrow{max-width:420px}fieldset{border:1px solid var(--line);border-radius:8px;padding:12px;display:grid;gap:10px;background:var(--card)}
 label{display:grid;gap:4px;font-size:.9rem}input,select,textarea{font:inherit;padding:7px 9px;border:1px solid #bbb;border-radius:6px;background:#fff;width:100%}
 textarea{min-height:80px}button,.button{font:inherit;font-weight:600;padding:8px 16px;border:0;border-radius:6px;background:var(--yellow);color:var(--ink);cursor:pointer;text-decoration:none;display:inline-block;white-space:nowrap}
-form.filters,form.inline{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px}form.filters input{flex:1;min-width:200px}form.filters select,form.inline input{width:auto}
+form.filters,form.inline{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px}form.filters input{flex:1;min-width:200px}form.filters select,form.inline input,form.inline select{width:auto}
 .cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px}.card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:4px 16px 16px}
 dl{display:grid;grid-template-columns:max-content 1fr;gap:6px 14px;margin:0}dt{color:var(--muted)}dd{margin:0}
 label.check{display:flex;gap:8px;align-items:center}label.qty{display:flex;gap:10px;align-items:center;justify-content:space-between}label.qty input{width:80px}.owed{color:var(--red)}label.check input{width:auto}.card.complete{border:2px solid var(--yellow)}
