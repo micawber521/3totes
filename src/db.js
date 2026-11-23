@@ -166,6 +166,11 @@ const MIGRATIONS = [
     // and ALL its totes join the extra-tote pool (not just the ones the first order needed).
     `ALTER TABLE kits ADD COLUMN totes_borrowed INTEGER NOT NULL DEFAULT 0`,
   ]],
+  [10, [
+    `ALTER TABLE bookings ADD COLUMN hub TEXT`,   // hub for customer pickup and/or drop-off: 'sikeston' | 'jackson'
+    `UPDATE settings SET value = 'We will text you the hub address and a time.'
+      WHERE key = 'pickup_location_text' AND value = 'We will text you our Sikeston address and a time.'`,
+  ]],
 ];
 
 let ready = false;
@@ -249,3 +254,6 @@ export async function addonPacksAvailable(db, s, start, end, excludeId = 0) {
   const borrowed = await db.prepare("SELECT COALESCE(SUM(totes_borrowed), 0) AS n FROM kits WHERE status != 'retired'").first();
   return Math.max(0, Math.floor(((Number(s.spare_totes) || 0) + borrowed.n) / ADDON_PACK_SIZE) - row.n);
 }
+
+export const HUBS = { sikeston: "Sikeston", jackson: "Jackson" };
+export const hubName = (k) => HUBS[k] || "our";

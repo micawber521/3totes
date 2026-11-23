@@ -1,7 +1,7 @@
 // Customer online booking (/book) + PayPal webhook.
 // Hidden behind the `online_booking` setting; while off, /book?preview=<booking_preview_key> still works
 // so Christian can test end to end (sandbox).
-import { ensureSchema, getSettings, kitBlocks, freeKit, kitConflict, newToken, addonPacksAvailable, ADDON_PACK_SIZE } from "./db.js";
+import { ensureSchema, getSettings, kitBlocks, freeKit, kitConflict, newToken, addonPacksAvailable, ADDON_PACK_SIZE, HUBS, hubName } from "./db.js";
 import { paypalReady, createRentalSubscription, getSubscription, verifyWebhook, firstRenewalDate } from "./paypal.js";
 import { trySend } from "./mail.js";
 import { cancelFee, customerCanCancel, cancelBooking, cancelPolicyText } from "./cancel.js";
@@ -117,8 +117,9 @@ async function start(request, env, s, url) {
   const b = await request.json().catch(() => null);
   if (!b) return json(400, { ok: false, msg: "Bad request" });
   const v = {};
-  for (const k of ["zip", "plan", "date", "est_return", "name", "phone", "email", "address", "notes", "signed_name", "fulfillment"]) v[k] = String(b[k] ?? "").trim();
+  for (const k of ["zip", "plan", "date", "est_return", "name", "phone", "email", "address", "notes", "signed_name", "fulfillment", "hub"]) v[k] = String(b[k] ?? "").trim();
   const self = v.fulfillment === "self";
+  if (self && !HUBS[v.hub]) return json(400, { ok: false, msg: "Pick which hub you'll get the kit from." });
   const packs = Number(b.addons || 0);
   if (!Number.isInteger(packs) || packs < 0 || packs > 10) return json(400, { ok: false, msg: "Pick how many extra tote packs you need." });
 
@@ -155,11 +156,11 @@ async function start(request, env, s, url) {
   const booking = await db.prepare(
     `INSERT INTO bookings (customer_id, kit_id, plan, status, address, zip, delivery_date, notes, deposit_cents, delivery_fee_cents,
        rate_first_cents, rate_recurring_cents, agreement_version, signed_name, signed_at, signed_ip, source, hold_expires_at,
-       est_return_date, manage_token, fulfillment, addon_packs, return_method)
-     VALUES (?, ?, ?, 'pending', ?, ?, ?, NULLIF(?, ''), ?, ?, ?, ?, ?, ?, datetime('now'), ?, 'online', datetime('now', ?), NULLIF(?, ''), ?, ?, ?, ?) RETURNING id`)
+       est_return_date, manage_token, fulfillment, addon_packs, return_method, hub)
+     VALUES (?, ?, ?, 'pending', ?, ?, ?, NULLIF(?, ''), ?, ?, ?, ?, ?, ?, datetime('now'), ?, 'online', datetime('now', ?), NULLIF(?, ''), ?, ?, ?, ?, ?) RETURNING id`)
     .bind(customer.id, kitId, v.plan, v.address, v.zip, v.date, v.notes, deposit, zone.delivery_fee_cents, r.first, r.recurring,
       s.agreement_version || null, v.signed_name, ip, `+${HOLD_MINUTES} minutes`, v.est_return, newToken(),
-      self ? "self" : "delivery", packs, self ? "dropoff" : "pickup").first();
+      self ? "self" : "delivery", packs, self ? "dropoff" : "pickup", self ? v.hub : null).first();
 
   // Two customers racing for the same kit: the earlier booking wins.
   const clash = await kitConflict(db, { kitId, start: v.date, end: windowEnd, bufferDays: s.buffer_days, excludeId: booking.id });
@@ -226,7 +227,7 @@ async function sendConfirmation(env, id) {
 Your tote rental is booked. Booking #${b.id}.
 
 ${isSelf(b)
-  ? `PICK UP YOUR KIT: ${niceDate(b.delivery_date)} at our Sikeston location. ${(await getSettings(env.DB)).pickup_location_text || ""}\nWhen you're done, bring it back to us (free).`
+  ? `PICK UP YOUR KIT: ${niceDate(b.delivery_date)} at our ${hubName(b.hub)} hub. ${(await getSettings(env.DB)).pickup_location_text || ""}\nWhen you're done, bring it back to one of our hubs (free).`
   : `DELIVERY: ${niceDate(b.delivery_date)}, first thing in the morning\nADDRESS: ${b.address}, ${b.zip}`}${b.est_return_date ? `\nYOUR ESTIMATED PICKUP: ${niceDate(b.est_return_date)} (just an estimate, change it anytime)` : ""}
 
 ${planLine}
@@ -236,7 +237,7 @@ Your rental time starts on delivery day. If you still have the kit after ${b.pla
 CANCELLING: ${cancelPolicyText(await getSettings(env.DB))} Cancel from your booking page below.
 
 YOUR KIT: 12 totes with lids${b.addon_packs ? ` + ${b.addon_packs * ADDON_PACK_SIZE} extra totes` : ""}, a hand truck, moving blankets, furniture sliders, lifting straps and load straps.
-Moving? Take the kit with you anywhere in our service area. Leaving the area? Drop it off with us before you go.
+Moving? Take the kit with you anywhere in our service area. Moving out of the area? Return it to one of our hubs (Sikeston or Jackson) before you go.
 
 YOUR BOOKING PAGE (schedule pickup, update your estimate):
 ${myLink(b)}
@@ -357,7 +358,7 @@ async function myPage(env, s, token, url) {
   const dropoff = b.return_method === "dropoff";
   const pickupBlock = b.pickup_date
     ? dropoff
-      ? `<p class="big">Drop-off: <b>${esc(niceDate(b.pickup_date))}</b> at our Sikeston location</p><p class="muted">${esc(s.pickup_location_text || "")} Please bring everything back with the totes <b>empty</b>.</p>`
+      ? `<p class="big">Drop-off: <b>${esc(niceDate(b.pickup_date))}</b> at our ${esc(hubName(b.hub))} hub</p><p class="muted">${esc(s.pickup_location_text || "")} Please bring everything back with the totes <b>empty</b>.</p>`
       : `<p class="big">Pickup: <b>${esc(niceDate(b.pickup_date))}</b><br><small>${esc(b.pickup_address || b.address)}, ${esc(b.pickup_zip || b.zip)}</small></p><p class="muted">Please have all totes <b>empty</b> and everything together by morning. We pick up the empty totes and equipment; we don't move your belongings.</p>`
     : `<p>Nothing scheduled yet. When you're done, tell us where to pick up the kit, or bring it back to us yourself.</p>`;
   return new Response(`${PAGE_HEAD("Your booking | Totes Totes Totes")}
@@ -367,7 +368,7 @@ async function myPage(env, s, token, url) {
   ${flash ? `<p class="card ok">${esc(flash)}</p>` : ""}
   <section class="card"><h2>Booking #${b.id}</h2>
     <p>Status: <b>${esc(MY_STATUS[b.status] || b.status)}</b></p>
-    ${isSelf(b) ? `<p>You pick up the kit: ${esc(niceDate(b.delivery_date))} at our Sikeston location<br><small>${esc(s.pickup_location_text || "")}</small></p>`
+    ${isSelf(b) ? `<p>You pick up the kit: ${esc(niceDate(b.delivery_date))} at our ${esc(hubName(b.hub))} hub<br><small>${esc(s.pickup_location_text || "")}</small></p>`
       : `<p>Delivery: ${esc(niceDate(b.delivery_date))}, first thing in the morning<br>${esc(b.address)}, ${esc(b.zip)}</p>`}
     ${b.addon_packs ? `<p>Extra totes: ${b.addon_packs * ADDON_PACK_SIZE} (${b.addon_packs} pack${b.addon_packs > 1 ? "s" : ""} of ${ADDON_PACK_SIZE})</p>` : ""}
     ${b.rate_recurring_cents ? `<p class="muted">${esc(planLine)}</p>` : ""}
@@ -384,7 +385,8 @@ async function myPage(env, s, token, url) {
           <label>Pickup address <small>(moved? enter your new address)</small> <input id="pick-address" maxlength="200" value="${esc(b.pickup_address || b.address)}"></label>
           <label>Zip <input id="pick-zip" inputmode="numeric" maxlength="5" value="${esc(b.pickup_zip || b.zip)}"></label>
         </div>
-        <label class="choice"><input type="radio" name="method" value="dropoff"${dropoff ? " checked" : ""}> <span><b>I'll drop it off</b> at your Sikeston location (free). <small>Required if you're moving outside our service area.</small></span></label>
+        <label class="choice"><input type="radio" name="method" value="dropoff"${dropoff ? " checked" : ""}> <span><b>I'll return it to a hub</b> (free). <small>Required if you're moving outside our service area.</small></span></label>
+        <div id="pick-hub"${dropoff ? "" : " hidden"}><label>Which hub? <select id="hub">${Object.entries(HUBS).map(([k, n]) => `<option value="${k}"${(b.hub || "sikeston") === k ? " selected" : ""}>${esc(n)}</option>`).join("")}</select></label></div>
         <label>Day <input type="date" id="pick-date" min="${min}" max="${max}" value="${esc(b.pickup_date && b.pickup_date >= min ? b.pickup_date : "")}" required></label>
         <button>${b.pickup_date ? "Update" : "Schedule"}</button></form>
       ${b.pickup_date ? `<p><button type="button" id="unpick" class="link">Cancel my ${dropoff ? "drop-off" : "pickup"}</button></p>` : ""}
@@ -410,10 +412,10 @@ async function myPage(env, s, token, url) {
   const post = (what, body, msgId) => fetch(base + "/" + what, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) })
     .then((r) => r.json()).catch(() => ({ ok: false, msg: "Something went wrong. Please try again." }))
     .then((r) => { if (r.ok) location.href = location.pathname + "?msg=" + encodeURIComponent(r.msg); else { const e = $(msgId); e.textContent = r.msg; e.className = "msg err"; } });
-  document.querySelectorAll("input[name=method]").forEach((r) => r.addEventListener("change", () => { $("pick-addr").hidden = r.value === "dropoff" && r.checked; }));
+  document.querySelectorAll("input[name=method]").forEach((r) => r.addEventListener("change", () => { const d = r.value === "dropoff" && r.checked; $("pick-addr").hidden = d; $("pick-hub").hidden = !d; }));
   $("pick") && $("pick").addEventListener("submit", (e) => { e.preventDefault();
     const m = document.querySelector("input[name=method]:checked").value;
-    post("pickup", { date: $("pick-date").value, method: m, address: $("pick-address").value, zip: $("pick-zip").value }, "pick-msg"); });
+    post("pickup", { date: $("pick-date").value, method: m, address: $("pick-address").value, zip: $("pick-zip").value, hub: $("hub").value }, "pick-msg"); });
   $("unpick") && $("unpick").addEventListener("click", () => { if (confirm("Cancel your pickup request?")) post("cancel_pickup", {}, "pick-msg"); });
   $("est") && $("est").addEventListener("submit", (e) => { e.preventDefault(); post("estimate", { date: $("est-date").value }, "est-msg"); });
   $("cancel-booking") && $("cancel-booking").addEventListener("click", (e) => { if (confirm("Cancel your booking? The cancellation fee is " + e.target.dataset.fee + ".")) post("cancel_booking", {}, "cancel-msg"); });
@@ -459,6 +461,7 @@ async function myAction(request, env, s, token, action) {
 
   // action === "pickup": we collect at an address inside the service area, or the customer drops it off.
   const method = body.method === "dropoff" ? "dropoff" : "pickup";
+  const hub = HUBS[body.hub] ? body.hub : (b.hub || "sikeston");
   // Default to the address already on file (pickup address if they moved, else delivery address).
   const addr = String(body.address || b.pickup_address || b.address || "").trim().slice(0, 200), zip = String(body.zip || b.pickup_zip || b.zip || "").trim();
   const min = earliestPickup(b, s);
@@ -468,21 +471,22 @@ async function myAction(request, env, s, token, action) {
   if (method === "pickup") {
     if (!addr || !/^\d{5}$/.test(zip)) return json(400, { ok: false, msg: "Enter the pickup address and a 5-digit zip." });
     const inArea = await db.prepare("SELECT 1 FROM zones WHERE zip = ?").bind(zip).first();
-    if (!inArea) return json(400, { ok: false, msg: "That address is outside our service area, so we can't pick up there. Please choose \"I'll drop it off\" and bring the kit back to us before you leave." });
+    if (!inArea) return json(400, { ok: false, msg: "That address is outside our service area, so we can't pick up there. Please choose \"I'll return it to a hub\" and drop the kit off at our Sikeston or Jackson hub before you leave." });
   }
   const label = method === "dropoff" ? "drop-off" : "pickup";
   await db.prepare(`UPDATE bookings SET pickup_date = ?, est_return_date = ?, return_method = ?, pickup_address = ?, pickup_zip = ?,
+    hub = CASE WHEN ? = 'dropoff' THEN ? ELSE hub END,
     status = CASE WHEN status = 'delivered' THEN 'pickup_requested' ELSE status END, updated_at = datetime('now') WHERE id = ?`)
-    .bind(date, date, method, method === "pickup" ? addr : null, method === "pickup" ? zip : null, b.id).run();
-  await log("pickup", `${b.pickup_date ? `customer changed to ${label}` : `customer scheduled ${label}`} ${date}${method === "pickup" ? ` at ${addr}, ${zip}` : ""}`);
+    .bind(date, date, method, method === "pickup" ? addr : null, method === "pickup" ? zip : null, method, hub, b.id).run();
+  await log("pickup", `${b.pickup_date ? `customer changed to ${label}` : `customer scheduled ${label}`} ${date}${method === "pickup" ? ` at ${addr}, ${zip}` : ` at ${hubName(hub)} hub`}`);
   const where = method === "pickup" ? `We'll pick up at: ${addr}, ${zip}\n\nPlease have all totes EMPTY and everything together by morning.\nWe pick up the empty totes and equipment; we don't move your belongings.`
-    : `Please bring the kit to our Sikeston location that day. ${s.pickup_location_text || ""}\nTotes should be EMPTY.`;
+    : `Please bring the kit to our ${hubName(hub)} hub that day. ${s.pickup_location_text || ""}\nTotes should be EMPTY.`;
   const items = `12 totes with lids${b.addon_packs ? ` + ${b.addon_packs * ADDON_PACK_SIZE} extra totes` : ""}, the hand truck, moving blankets, furniture sliders, lifting straps and load straps.`;
   await trySend(env, { to: b.email, subject: `${label === "pickup" ? "Pickup" : "Drop-off"} scheduled: ${niceDate(date)}`, replyTo: owner ? `<${owner}>` : undefined,
     text: `Hi ${b.name},\n\nYour ${label} is scheduled for ${niceDate(date)}.\n\n${where}\n\nWhat comes back: ${items}\n\nNeed to change it? ${myLink(b)}\n\nThanks!\nTotes Totes Totes\n` });
   if (owner) await trySend(env, { to: owner, fromName: "3totes bookings", subject: `${label === "pickup" ? "Pickup" : "Drop-off"} ${b.pickup_date ? "changed" : "scheduled"}: ${date}, booking #${b.id}`,
-    text: `${b.name}: ${label} on ${niceDate(date)}.\n${method === "pickup" ? `${addr}, ${zip}` : "Customer is bringing it to you."} | ${b.phone}\n\nhttps://3totes.com/admin/bookings/${b.id}\n` });
-  return json(200, { ok: true, msg: `${label === "pickup" ? "Pickup" : "Drop-off"} scheduled for ${niceDate(date)}. We sent you a confirmation email.` });
+    text: `${b.name}: ${label} on ${niceDate(date)}.\n${method === "pickup" ? `${addr}, ${zip}` : `Customer is bringing it to the ${hubName(hub)} hub.`} | ${b.phone}\n\nhttps://3totes.com/admin/bookings/${b.id}\n` });
+  return json(200, { ok: true, msg: `${label === "pickup" ? "Pickup" : `Drop-off at our ${hubName(hub)} hub`} scheduled for ${niceDate(date)}. We sent you a confirmation email.` });
 }
 
 // ---------- public price list (/prices) ----------
@@ -539,7 +543,8 @@ ${preview ? `<div class="banner">PREVIEW: online booking is OFF. Payments use th
     <p id="zip-msg" class="msg"></p>
     <div id="ful" hidden>
       <label class="choice" id="ful-del-wrap"><input type="radio" name="ful" value="delivery"> <span><b>Deliver to me</b> <small id="ful-del-note"></small></span></label>
-      <label class="choice"><input type="radio" name="ful" value="self"> <span><b>I'll pick it up</b> at your Sikeston location and bring it back when I'm done (free)</span></label>
+      <label class="choice"><input type="radio" name="ful" value="self"> <span><b>I'll pick it up</b> at one of your hubs and bring it back when I'm done (free)</span></label>
+      <label id="hub-wrap" hidden>Which hub? <select id="hub">${Object.entries(HUBS).map(([k, n]) => `<option value="${k}">${esc(n)}</option>`).join("")}</select></label>
     </div>
     <div id="wait" hidden><p class="muted">We don't deliver there yet, but you can pick up the kit yourself. Want to know when we deliver to you?</p>
       <div class="row"><input id="wait-email" type="email" placeholder="you@example.com"><button type="button" id="wait-btn">Notify me</button></div></div>
@@ -624,7 +629,8 @@ function setFul() {
   st.ful = v.value; st.fee = st.ful === "delivery" ? st.zoneFee : 0;
   $("addr-label").textContent = st.ful === "self" ? "Your address" : "Delivery address";
   $("date-title").textContent = st.ful === "self" ? "Pick the day you'll get the kit" : "Pick your delivery day";
-  $("date-note").textContent = st.ful === "self" ? "We'll text you our Sikeston address and a time. Keep the totes as long as you need." : "We drop off first thing in the morning. Keep the totes as long as you need.";
+  $("hub-wrap").hidden = st.ful !== "self";
+  $("date-note").textContent = st.ful === "self" ? "We'll text you the hub address and a time. Keep the totes as long as you need." : "We drop off first thing in the morning. Keep the totes as long as you need.";
   show("s-plan"); show("s-date"); if (!st.dates.length) loadDates(); summary();
 }
 document.querySelectorAll("input[name=ful]").forEach((r) => r.addEventListener("change", setFul));
@@ -692,7 +698,7 @@ function summary() {
     " Cancel before delivery: " + C.cancelText + "</p>";
 }
 function form() {
-  return { zip: st.zip, fulfillment: st.ful, addons: Number($("addons").value) || 0, plan: st.plan, date: st.date, est_return: $("est").value, name: $("name").value, phone: $("phone").value, email: $("email").value,
+  return { zip: st.zip, fulfillment: st.ful, hub: $("hub").value, addons: Number($("addons").value) || 0, plan: st.plan, date: st.date, est_return: $("est").value, name: $("name").value, phone: $("phone").value, email: $("email").value,
     address: $("address").value, notes: $("notes").value, agree: $("agree").checked, signed_name: $("signed").value };
 }
 function check() {

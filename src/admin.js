@@ -1,7 +1,7 @@
 // /admin: server-rendered pages for Christian (owner) and drivers.
 // Step 1 of BOOKING_DESIGN: kits, manual bookings, schedule, settings. No payments yet.
 import { adminIdentity } from "./access.js";
-import { ensureSchema, getSettings, kitConflict, newToken, addonPacksAvailable, ADDON_PACK_SIZE } from "./db.js";
+import { ensureSchema, getSettings, kitConflict, newToken, addonPacksAvailable, ADDON_PACK_SIZE, HUBS, hubName } from "./db.js";
 import { paypalReady, refundSale, cancelSubscription } from "./paypal.js";
 import { trySend } from "./mail.js";
 import { cancelFee, cancelBooking } from "./cancel.js";
@@ -131,7 +131,7 @@ async function schedule(db, who, flash) {
     return `<tr class="${late ? "late" : date === t ? "today" : ""}">
       <td>${date ? esc(niceDate(date)) : "<em>no date</em>"}${late ? " <b>overdue</b>" : ""}</td>
       <td>${name}<br><small>${esc(b.phone || "")}</small></td>
-      <td>${atUs ? `<b>${kind === "drop" ? "Customer picks up at our location" : "Customer drops off at our location"}</b>` : `<a href="${esc(map)}" target="_blank" rel="noopener">${esc(addr)}, ${esc(zip)}</a>${kind === "pick" && b.pickup_address ? " <small>(new address)</small>" : ""}`}${b.addon_packs ? `<br><small>+${b.addon_packs * ADDON_PACK_SIZE} extra totes</small>` : ""}${b.notes ? `<br><small>${esc(b.notes)}</small>` : ""}</td>
+      <td>${atUs ? `<b>${kind === "drop" ? `Customer picks up at ${esc(hubName(b.hub))} hub` : `Customer drops off at ${esc(hubName(b.hub))} hub`}</b>` : `<a href="${esc(map)}" target="_blank" rel="noopener">${esc(addr)}, ${esc(zip)}</a>${kind === "pick" && b.pickup_address ? " <small>(new address)</small>" : ""}`}${b.addon_packs ? `<br><small>+${b.addon_packs * ADDON_PACK_SIZE} extra totes</small>` : ""}${b.notes ? `<br><small>${esc(b.notes)}</small>` : ""}</td>
       <td>${esc(b.kit)}</td><td>${badge(b.status)}</td></tr>`;
   };
   const table = (rows, kind, empty) => rows.length
@@ -193,7 +193,8 @@ async function bookingForm(db, who, v, error) {
         <label>Plan <select name="plan">
           <option value="moving"${plan === "moving" ? " selected" : ""}>Moving: ${money(s.moving_first_cents)} first 2 weeks, then ${money(s.moving_weekly_cents)}/week</option>
           <option value="storage"${plan === "storage" ? " selected" : ""}>Storage: ${money(s.storage_monthly_cents)}/month</option></select></label>
-        <label>Handoff <select name="fulfillment"><option value="delivery">We deliver &amp; pick up</option><option value="self"${v.fulfillment === "self" ? " selected" : ""}>Customer picks up &amp; returns</option></select></label>
+        <label>Handoff <select name="fulfillment"><option value="delivery">We deliver &amp; pick up</option><option value="self"${v.fulfillment === "self" ? " selected" : ""}>Customer picks up &amp; returns at a hub</option></select></label>
+        <label>Hub <small>(customer pickup/return)</small> <select name="hub">${Object.entries(HUBS).map(([k, n]) => `<option value="${k}"${v.hub === k ? " selected" : ""}>${esc(n)}</option>`).join("")}</select></label>
         <label>Extra totes <small>(packs of ${ADDON_PACK_SIZE})</small> <input name="addon_packs" type="number" min="0" max="10" value="${esc(v.addon_packs || "0")}"></label>
         <label>Kit <select name="kit_id">${kits.map((k) => `<option value="${k.id}"${String(k.id) === String(v.kit_id) ? " selected" : ""}>${esc(k.label)}${k.status === "cleaning" ? " (cleaning)" : ""}</option>`).join("")}</select></label>
         <label>Deposit <input name="deposit" inputmode="decimal" value="${esc(v.deposit ?? (Number(s.deposit_cents || 0) / 100).toFixed(2))}"></label>
@@ -247,10 +248,10 @@ async function bookingCreate(db, who, request) {
   const status = v.status === "pending" ? "pending" : "confirmed";
   const b = await db.prepare(
     `INSERT INTO bookings (customer_id, kit_id, plan, status, address, zip, delivery_date, pickup_date, notes, deposit_cents, agreement_version, source,
-       est_return_date, manage_token, fulfillment, addon_packs, return_method)
-     VALUES (?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), ?, ?, 'admin', NULLIF(?, ''), ?, ?, ?, ?) RETURNING id`)
+       est_return_date, manage_token, fulfillment, addon_packs, return_method, hub)
+     VALUES (?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), ?, ?, 'admin', NULLIF(?, ''), ?, ?, ?, ?, ?) RETURNING id`)
     .bind(customer.id, kit.id, v.plan, status, v.address, v.zip, v.delivery_date, v.pickup_date || "", v.notes || "", deposit, s.agreement_version || null,
-      v.est_return_date || "", newToken(), self ? "self" : "delivery", packs, self ? "dropoff" : "pickup").first();
+      v.est_return_date || "", newToken(), self ? "self" : "delivery", packs, self ? "dropoff" : "pickup", self ? (HUBS[v.hub] ? v.hub : "sikeston") : null).first();
   await logEvent(db, b.id, who, "created", `${v.plan}, ${kit.label}, delivery ${v.delivery_date}`);
   return redirect(`/admin/bookings/${b.id}?msg=${encodeURIComponent("Booking created.")}`);
 }
@@ -310,7 +311,7 @@ async function bookingView(db, who, id, flash, error = "") {
         <dt>Customer</dt><dd>${esc(b.name)}<br>${esc(b.phone || "")}${b.email ? `<br><a href="mailto:${esc(b.email)}">${esc(b.email)}</a>` : ""}</dd>
         <dt>Address</dt><dd>${esc(b.address)}, ${esc(b.zip)}</dd>
         <dt>Plan</dt><dd>${esc(b.plan)}${b.addon_packs ? ` + ${b.addon_packs * ADDON_PACK_SIZE} extra totes (${b.addon_packs} pack${b.addon_packs > 1 ? "s" : ""})` : ""}</dd>
-        <dt>Handoff</dt><dd>${b.fulfillment === "self" ? "Customer picks up at our location" : "We deliver"} · return: ${b.return_method === "dropoff" ? "customer drops off" : `we pick up${b.pickup_address ? ` at <b>${esc(b.pickup_address)}, ${esc(b.pickup_zip || "")}</b> (new address)` : ""}`}</dd>
+        <dt>Handoff</dt><dd>${b.fulfillment === "self" ? `Customer picks up at ${esc(hubName(b.hub))} hub` : "We deliver"} · return: ${b.return_method === "dropoff" ? `customer drops off at ${esc(hubName(b.hub))} hub` : `we pick up${b.pickup_address ? ` at <b>${esc(b.pickup_address)}, ${esc(b.pickup_zip || "")}</b> (new address)` : ""}`}</dd>
         <dt>Kit</dt><dd>${esc(b.kit)}</dd>
         <dt>Delivery</dt><dd>${esc(niceDate(b.delivery_date))}, first thing in the morning</dd>
         <dt>Pickup</dt><dd>${b.pickup_date ? esc(niceDate(b.pickup_date)) : "Open-ended"}</dd>
