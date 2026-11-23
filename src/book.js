@@ -551,8 +551,8 @@ ${preview ? `<div class="banner">PREVIEW: online booking is OFF. Payments use th
   </section>
 
   <section class="card" id="s-plan" hidden><h2><span>2</span> Pick a plan</h2>
-    <label class="choice"><input type="radio" name="plan" value="moving" checked> <b>Moving</b>: <span id="p-moving"></span></label>
-    <label class="choice"><input type="radio" name="plan" value="storage"> <b>Storage</b>: <span id="p-storage"></span></label>
+    <label class="choice"><input type="radio" name="plan" value="moving" checked> <span><b>Moving:</b> <span id="p-moving"></span></span></label>
+    <label class="choice"><input type="radio" name="plan" value="storage"> <span><b>Storage:</b> <span id="p-storage"></span></span></label>
     <p class="muted" id="p-deposit"></p>
   </section>
 
