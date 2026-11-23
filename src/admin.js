@@ -242,6 +242,7 @@ async function bookingView(db, who, id, flash, error = "") {
   const refundLeft = b.deposit_cents - b.deposit_refunded_cents;
   const billingOn = b.paypal_subscription_id && !["CANCELLED", "EXPIRED"].includes(b.billing_status || "");
   const online = b.source === "online";
+  const rr = rentalRefundInfo(b, pays);
   const billing = online ? `<section class="card"><h2>PayPal</h2>
       <p>Billing: <b>${esc(b.billing_status || "unknown")}</b>${b.plan === "moving" ? ` · ${money(b.rate_first_cents)} first 2 weeks, then ${money(b.rate_recurring_cents)}/week` : ` · ${money(b.rate_recurring_cents)}/month`}
       ${b.delivery_fee_cents ? ` · delivery fee ${money(b.delivery_fee_cents)}` : ""}</p>
@@ -250,6 +251,9 @@ async function bookingView(db, who, id, flash, error = "") {
       ${setup && refundLeft > 0 ? `<form method="post" class="inline" onsubmit="return confirm('Refund this amount through PayPal?')"><input type="hidden" name="action" value="refund">
         <label>Refund deposit <input name="amount" inputmode="decimal" value="${(refundLeft / 100).toFixed(2)}"></label><button>Refund via PayPal</button>
         <small class="muted">Lower the amount to keep damage charges.</small></form>` : ""}
+      ${rr ? `<form method="post" class="inline" onsubmit="return confirm('Refund this rental amount through PayPal?')"><input type="hidden" name="action" value="refund_rental">
+        <label>Refund unused weeks <input name="amount" inputmode="decimal" value="${(rr.suggest / 100).toFixed(2)}"></label><button>Refund rental via PayPal</button>
+        <small class="muted">${esc(rr.note)}</small></form>` : ""}
     </section>` : "";
   return page(`Booking #${b.id}: ${b.name}`, who, `
     ${error ? `<p class="error">${esc(error)}</p>` : ""}
@@ -290,7 +294,7 @@ async function bookingUpdate(db, who, id, request, env) {
   const b = await db.prepare("SELECT * FROM bookings WHERE id = ?").bind(id).first();
   if (!b) return deny(404, "Not found");
   const v = await readForm(request);
-  if (v.action === "cancel_billing" || v.action === "refund") return billingAction(db, who, b, v, env);
+  if (["cancel_billing", "refund", "refund_rental"].includes(v.action)) return billingAction(db, who, b, v, env);
   const s = await getSettings(db);
   const fail = (msg) => bookingView(db, who, id, "", msg);
 
@@ -431,6 +435,20 @@ async function billingAction(db, who, b, v, env) {
     await logEvent(db, b.id, who, "billing", "billing stopped by admin");
     return back("Billing stopped.");
   }
+  if (v.action === "refund_rental") {
+    const pays = (await db.prepare("SELECT * FROM payments WHERE booking_id = ? ORDER BY id").bind(b.id).all()).results;
+    const rr = rentalRefundInfo(b, pays);
+    const amt = toCents(v.amount || "");
+    if (!rr) return back("There's no rental payment to refund.");
+    if (!amt || amt <= 0) return back("Enter a refund amount.");
+    if (amt > rr.left) return back(`That's more than the ${money(rr.left)} left on the last rental payment.`);
+    const r = await refundSale(env, rr.saleId, amt);
+    if (!r.ok) return back(`PayPal refused the refund (${r.status}). Nothing changed.`);
+    await db.prepare("INSERT OR IGNORE INTO payments (booking_id, kind, amount_cents, paypal_id, status, refund_of) VALUES (?, 'refund', ?, ?, ?, ?)")
+      .bind(b.id, amt, r.data.id || null, r.data.state || "completed", rr.saleId).run();
+    await logEvent(db, b.id, who, "refund", `rental refund ${money(amt)} via PayPal (${rr.note})`);
+    return back(`Refunded ${money(amt)} of rent.`);
+  }
   const cents = toCents(v.amount || "");
   const left = b.deposit_cents - b.deposit_refunded_cents;
   if (!cents || cents <= 0) return back("Enter a refund amount.");
@@ -441,11 +459,35 @@ async function billingAction(db, who, b, v, env) {
   if (!r.ok) return back(`PayPal refused the refund (${r.status}). Nothing changed.`);
   await db.batch([
     db.prepare("UPDATE bookings SET deposit_refunded_cents = deposit_refunded_cents + ? WHERE id = ?").bind(cents, b.id),
-    db.prepare("INSERT OR IGNORE INTO payments (booking_id, kind, amount_cents, paypal_id, status) VALUES (?, 'refund', ?, ?, ?)")
-      .bind(b.id, cents, r.data.id || null, r.data.state || "completed"),
+    db.prepare("INSERT OR IGNORE INTO payments (booking_id, kind, amount_cents, paypal_id, status, refund_of) VALUES (?, 'refund', ?, ?, ?, ?)")
+      .bind(b.id, cents, r.data.id || null, r.data.state || "completed", setup.paypal_id),
   ]);
   await logEvent(db, b.id, who, "refund", `deposit refund ${money(cents)} via PayPal${cents < left ? ` (kept ${money(left - cents)})` : ""}`);
   return back(`Refunded ${money(cents)}.`);
+}
+
+// Storage policy (2026-11-23): after pickup, refund each unused FULL week of the last paid month
+// at the weekly equivalent (monthly x 12 / 52). Moving plan: 2-week minimum, partial weeks not refunded.
+function rentalRefundInfo(b, pays) {
+  const rentals = pays.filter((p) => p.kind === "rental" && p.paypal_id);
+  if (!rentals.length) return null;
+  const last = rentals[rentals.length - 1];
+  const refunded = pays.filter((p) => p.kind === "refund" && p.refund_of === last.paypal_id).reduce((a, p) => a + p.amount_cents, 0);
+  const left = last.amount_cents - refunded;
+  if (left <= 0) return null;
+  let suggest = 0, note = b.plan === "moving" ? "Moving plan: 2-week minimum, partial weeks aren't refunded." : "Set a pickup date to calculate unused weeks.";
+  if (b.plan === "storage" && b.pickup_date) {
+    const paid = new Date(last.created_at.replace(" ", "T") + "Z");
+    const periodStart = paid.toLocaleDateString("en-CA", { timeZone: TZ });
+    const d = new Date(periodStart + "T12:00:00Z"); d.setUTCMonth(d.getUTCMonth() + 1);
+    const periodEnd = d.toISOString().slice(0, 10); // first day of the next billing month
+    const unusedDays = Math.round((Date.parse(periodEnd + "T12:00:00Z") - Date.parse(b.pickup_date + "T12:00:00Z")) / 86400000);
+    const weeks = Math.max(0, Math.floor(unusedDays / 7));
+    const weekly = Math.round((b.rate_recurring_cents || 0) * 12 / 52);
+    suggest = Math.max(0, Math.min(weeks * weekly - refunded, left)); // minus anything already refunded from this payment
+    note = `Paid ${periodStart} for the month to ${periodEnd}; pickup ${b.pickup_date} leaves ${Math.max(0, unusedDays)} days = ${weeks} full week${weeks === 1 ? "" : "s"} × ${money(weekly)}.`;
+  }
+  return { saleId: last.paypal_id, left, suggest, note };
 }
 
 // ---------- zones ----------

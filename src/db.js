@@ -105,6 +105,11 @@ const MIGRATIONS = [
     `UPDATE bookings SET manage_token = lower(hex(randomblob(24))) WHERE manage_token IS NULL`,
     `CREATE UNIQUE INDEX IF NOT EXISTS bookings_manage_token ON bookings (manage_token)`,
   ]],
+  [4, [
+    `ALTER TABLE payments ADD COLUMN refund_of TEXT`,  // PayPal sale id a refund came out of
+    `UPDATE payments SET refund_of = (SELECT p2.paypal_id FROM payments p2 WHERE p2.booking_id = payments.booking_id AND p2.kind = 'setup')
+      WHERE kind = 'refund' AND refund_of IS NULL`,
+  ]],
 ];
 
 let ready = false;
