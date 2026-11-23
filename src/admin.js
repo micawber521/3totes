@@ -108,12 +108,12 @@ export async function handleAdmin(request, env) {
 async function schedule(db, who, flash) {
   const t = today(), horizon = addDays(t, 14);
   const drops = (await db.prepare(
-    `SELECT b.*, c.name, c.phone, k.label AS kit FROM bookings b
+    `SELECT b.*, c.name, c.phone, k.label AS kit, k.location AS kit_loc FROM bookings b
        JOIN customers c ON c.id = b.customer_id JOIN kits k ON k.id = b.kit_id
       WHERE b.status IN ('pending','confirmed') AND b.delivery_date <= ?
       ORDER BY b.delivery_date, b.id`).bind(horizon).all()).results;
   const pickups = (await db.prepare(
-    `SELECT b.*, c.name, c.phone, k.label AS kit FROM bookings b
+    `SELECT b.*, c.name, c.phone, k.label AS kit, k.location AS kit_loc FROM bookings b
        JOIN customers c ON c.id = b.customer_id JOIN kits k ON k.id = b.kit_id
       WHERE b.status IN ('delivered','pickup_requested')
         AND (b.status = 'pickup_requested' OR (b.pickup_date IS NOT NULL AND b.pickup_date <= ?))
@@ -134,7 +134,7 @@ async function schedule(db, who, flash) {
       <td>${date ? esc(niceDate(date)) : "<em>no date</em>"}${late ? " <b>overdue</b>" : ""}</td>
       <td>${name}<br><small>${esc(b.phone || "")}</small></td>
       <td>${atUs ? `<b>${kind === "drop" ? `Customer picks up at ${esc(hubName(b.hub))} hub` : `Customer drops off at ${esc(hubName(b.hub))} hub`}</b>` : `<a href="${esc(map)}" target="_blank" rel="noopener">${esc(addr)}, ${esc(zip)}</a>${kind === "pick" && b.pickup_address ? " <small>(new address)</small>" : ""}`}${b.addon_packs ? `<br><small>+${b.addon_packs * ADDON_PACK_SIZE} extra totes</small>` : ""}${b.notes ? `<br><small>${esc(b.notes)}</small>` : ""}</td>
-      <td>${esc(b.kit)}</td><td>${badge(b.status)}</td></tr>`;
+      <td>${esc(b.kit)}${b.kit_loc ? `<br><small>at ${esc(hubName(b.kit_loc))}</small>` : ""}${kind === "drop" && b.fulfillment === "self" && b.hub && b.kit_loc && b.hub !== b.kit_loc ? `<br><b class="owed">move to ${esc(hubName(b.hub))}</b>` : ""}</td><td>${badge(b.status)}</td></tr>`;
   };
   const table = (rows, kind, empty) => rows.length
     ? `<table><thead><tr><th>Date</th><th>Customer</th><th>Address</th><th>Kit</th><th>Status</th></tr></thead><tbody>${rows.map((b) => stop(b, kind === "drop" ? b.delivery_date : b.pickup_date, kind)).join("")}</tbody></table>`
@@ -261,7 +261,7 @@ async function bookingCreate(db, who, request) {
 
 async function bookingView(db, who, id, flash, error = "") {
   const b = await db.prepare(
-    `SELECT b.*, c.name, c.email, c.phone, k.label AS kit FROM bookings b
+    `SELECT b.*, c.name, c.email, c.phone, k.label AS kit, k.location AS kit_loc FROM bookings b
        JOIN customers c ON c.id = b.customer_id JOIN kits k ON k.id = b.kit_id WHERE b.id = ?`).bind(id).first();
   if (!b) return deny(404, "Not found");
   const events = (await db.prepare("SELECT * FROM booking_events WHERE booking_id = ? ORDER BY id DESC").bind(id).all()).results;
@@ -315,7 +315,7 @@ async function bookingView(db, who, id, flash, error = "") {
         <dt>Address</dt><dd>${esc(b.address)}, ${esc(b.zip)}</dd>
         <dt>Plan</dt><dd>${esc(b.plan)}${b.addon_packs ? ` + ${b.addon_packs * ADDON_PACK_SIZE} extra totes (${b.addon_packs} pack${b.addon_packs > 1 ? "s" : ""})` : ""}</dd>
         <dt>Handoff</dt><dd>${b.fulfillment === "self" ? `Customer picks up at ${esc(hubName(b.hub))} hub` : "We deliver"} · return: ${b.return_method === "dropoff" ? `customer drops off at ${esc(hubName(b.hub))} hub` : `we pick up${b.pickup_address ? ` at <b>${esc(b.pickup_address)}, ${esc(b.pickup_zip || "")}</b> (new address)` : ""}`}</dd>
-        <dt>Kit</dt><dd>${esc(b.kit)}</dd>
+        <dt>Kit</dt><dd>${esc(b.kit)}${b.kit_loc ? ` <small>(kept at ${esc(hubName(b.kit_loc))})</small>` : ""}</dd>
         <dt>Delivery</dt><dd>${esc(niceDate(b.delivery_date))}, first thing in the morning</dd>
         <dt>Pickup</dt><dd>${b.pickup_date ? esc(niceDate(b.pickup_date)) : "Open-ended"}</dd>
         <dt>Est. return</dt><dd>${b.est_return_date ? esc(niceDate(b.est_return_date)) + " <small>(customer estimate)</small>" : "<span class='muted'>none</span>"}</dd>
@@ -413,12 +413,13 @@ async function kitsPage(db, who, flash) {
   return page("Kits", who, `
     <p class="muted">Need to break up a kit for an extra-tote order? Check <b>Split for extras</b>. That kit can't be booked while it's split,
       and all ${KIT_TOTES} of its totes become extra totes (packs of ${ADDON_PACK_SIZE}). Uncheck it when the kit is whole again.</p>
-    <table><thead><tr><th>Kit</th><th>Where</th><th>Next drop-off</th><th>Status</th><th>Split for extras</th><th>Notes</th><th></th></tr></thead><tbody>
+    <table><thead><tr><th>Kit</th><th>Kept at</th><th>Where</th><th>Next drop-off</th><th>Status</th><th>Split for extras</th><th>Notes</th><th></th></tr></thead><tbody>
     ${kits.map((k) => {
       const [bid, bname] = (k.out_with || "").split("|");
       const f = `kit-${k.id}`;
       return `<tr>
         <td><b>${esc(k.label)}</b></td>
+        <td><select name="location" form="${f}">${allHubs().map((h) => `<option value="${esc(h.key)}"${h.key === k.location ? " selected" : ""}>${esc(h.name)}</option>`).join("")}</select></td>
         <td>${k.out_with ? `Out: <a href="/admin/bookings/${esc(bid)}">${esc(bname)}</a>${k.back ? `<br><small>back ${k.back.startsWith("~") ? "~" + esc(niceDate(k.back.slice(1))) + " (estimate)" : esc(niceDate(k.back))}</small>` : "<br><small>no return date</small>"}` : k.status === "retired" ? "Retired" : k.totes_borrowed ? `<b class="owed">Split for extra totes</b><br><small>not rentable</small>` : "Home"}</td>
         <td>${k.next_drop ? esc(niceDate(k.next_drop)) : "<span class='muted'>none</span>"}</td>
         <td><select name="status" form="${f}">${KIT_STATUSES.map((s) => `<option${s === k.status ? " selected" : ""}>${s}</option>`).join("")}</select></td>
@@ -429,14 +430,15 @@ async function kitsPage(db, who, flash) {
     </tbody></table>
     <h2>Add a kit</h2>
     <form method="post" class="inline"><input type="hidden" name="action" value="add">
-      <input name="label" placeholder="K02" required maxlength="20" pattern="[A-Za-z0-9-]+"><input name="notes" placeholder="Notes" maxlength="500"><button>Add kit</button></form>`, flash);
+      <input name="label" placeholder="K02" required maxlength="20" pattern="[A-Za-z0-9-]+"><select name="location">${allHubs().map((h) => `<option value="${esc(h.key)}">${esc(h.name)}</option>`).join("")}</select><input name="notes" placeholder="Notes" maxlength="500"><button>Add kit</button></form>`, flash);
 }
 
 async function kitsPost(db, request) {
   const v = await readForm(request);
   if (v.action === "add") {
     if (!/^[A-Za-z0-9-]{1,20}$/.test(v.label || "")) return redirect("/admin/kits?msg=" + encodeURIComponent("Kit label: letters, numbers and dashes only."));
-    const r = await db.prepare("INSERT OR IGNORE INTO kits (label, notes) VALUES (?, NULLIF(?, ''))").bind(v.label.toUpperCase(), v.notes || "").run();
+    const loc = allHubs().some((h) => h.key === v.location) ? v.location : (allHubs()[0] || {}).key || null;
+    const r = await db.prepare("INSERT OR IGNORE INTO kits (label, notes, location) VALUES (?, NULLIF(?, ''), ?)").bind(v.label.toUpperCase(), v.notes || "", loc).run();
     return redirect("/admin/kits?msg=" + encodeURIComponent(r.meta.changes ? `Added ${v.label.toUpperCase()}.` : "That label already exists."));
   }
   if (!KIT_STATUSES.includes(v.status)) return redirect("/admin/kits");
@@ -458,7 +460,8 @@ async function kitsPost(db, request) {
     if (free < Math.ceil(kit.totes_borrowed / ADDON_PACK_SIZE))
       return back(`Extra totes from ${kit.label} are still booked or out. Leave it split until they're back.`);
   }
-  await db.prepare("UPDATE kits SET status = ?, notes = NULLIF(?, ''), totes_borrowed = ? WHERE id = ?").bind(v.status, v.notes || "", lent, kit.id).run();
+  const loc = allHubs().some((h) => h.key === v.location) ? v.location : kit.location;
+  await db.prepare("UPDATE kits SET status = ?, notes = NULLIF(?, ''), totes_borrowed = ?, location = ? WHERE id = ?").bind(v.status, v.notes || "", lent, loc, kit.id).run();
   return back(lent !== kit.totes_borrowed
     ? (lent ? `${kit.label} is split: its ${KIT_TOTES} totes are now extra totes, and it can't be booked until you uncheck it.` : `${kit.label} is whole again and bookable.`)
     : "Saved.");

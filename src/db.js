@@ -186,6 +186,10 @@ const MIGRATIONS = [
     `INSERT OR IGNORE INTO hubs (key, name, sort) VALUES ('sikeston', 'Sikeston', 10), ('jackson', 'Jackson', 20)`,
     `UPDATE settings SET value = '' WHERE key = 'pickup_location_text' AND value = 'We will text you the hub address and a time.'`,
   ]],
+  [14, [
+    `ALTER TABLE kits ADD COLUMN location TEXT`,   // locations (hubs table) key where the kit is kept
+    `UPDATE kits SET location = 'sikeston' WHERE location IS NULL`,
+  ]],
 ];
 
 let ready = false;
