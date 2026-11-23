@@ -752,7 +752,7 @@ h1{font-size:clamp(1.8rem,6vw,2.4rem);margin:.3em 0}.lede{color:var(--muted)}
 .banner{background:var(--yellow);text-align:center;padding:6px 12px;font-size:.9rem;font-weight:600}
 .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px 18px;margin-top:16px}
 .card.ok{border-color:var(--green)}.card h2{font-size:1.15rem;margin:0 0 10px;display:flex;align-items:center;gap:10px}
-.card h2 span{display:inline-grid;place-items:center;width:28px;height:28px;border-radius:50%;background:var(--yellow);font-size:.95rem}
+.card h2 > span:first-child{display:inline-grid;place-items:center;width:28px;height:28px;border-radius:50%;background:var(--yellow);font-size:.95rem}
 label{display:grid;gap:4px;margin:10px 0;font-size:.95rem}label.choice{display:flex;gap:10px;align-items:baseline;cursor:pointer}
 input:not([type=radio]):not([type=checkbox]),textarea{font:inherit;padding:10px 12px;border:1px solid #bbb;border-radius:8px;width:100%;background:#fff}
 textarea{min-height:80px}button{font:inherit;font-weight:600;padding:10px 16px;border:0;border-radius:8px;background:var(--yellow);color:var(--ink);cursor:pointer}
