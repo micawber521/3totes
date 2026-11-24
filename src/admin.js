@@ -1,7 +1,7 @@
 // /admin: server-rendered pages for Christian (owner) and drivers.
 // Step 1 of BOOKING_DESIGN: kits, manual bookings, schedule, settings. No payments yet.
 import { adminIdentity } from "./access.js";
-import { ensureSchema, getSettings, kitConflict, newToken, addonPacksAvailable, ADDON_PACK_SIZE, HUBS, hubName, allHubs, deliveryAddr, pickupAddr } from "./db.js";
+import { ensureSchema, getSettings, kitConflict, newToken, addonPacksAvailable, ADDON_PACK_SIZE, HUBS, hubName, allHubs, deliveryAddr, pickupAddr, kitClash } from "./db.js";
 import { paypalReady, refundSale, cancelSubscription } from "./paypal.js";
 import { trySend } from "./mail.js";
 import { cancelFee, cancelBooking } from "./cancel.js";
@@ -123,6 +123,8 @@ async function schedule(db, who, flash) {
       WHERE b.status IN ('pending','confirmed') AND b.delivery_date <= ?
         AND NOT (b.status = 'pending' AND b.hold_expires_at IS NOT NULL)
       ORDER BY b.delivery_date, b.id`).bind(horizon).all()).results;
+  const bufferDays = (await getSettings(db)).buffer_days;
+  for (const b of drops) b.clash = await kitClash(db, b, bufferDays);
   const checkouts = who.role === "owner" ? (await db.prepare(
     `SELECT b.id, b.delivery_date, b.hold_expires_at, c.name FROM bookings b JOIN customers c ON c.id = b.customer_id
       WHERE b.status = 'pending' AND b.hold_expires_at IS NOT NULL AND b.hold_expires_at >= datetime('now')
@@ -149,7 +151,7 @@ async function schedule(db, who, flash) {
       <td>${date ? esc(niceDate(date)) : "<em>no date</em>"}${late ? " <b>overdue</b>" : ""}</td>
       <td>${name}<br><small>${esc(b.phone || "")}</small></td>
       <td>${atUs ? `<b>${kind === "drop" ? `Customer picks up at ${esc(hubName(b.hub))} hub` : `Customer drops off at ${esc(hubName(b.hub))} hub`}</b>` : `<a href="${esc(map)}" target="_blank" rel="noopener">${esc(addr)}</a>${kind === "pick" && b.pickup_address ? " <small>(new address)</small>" : ""}`}${b.addon_packs ? `<br><small>+${b.addon_packs * ADDON_PACK_SIZE} extra totes</small>` : ""}${b.notes ? `<br><small>${esc(b.notes)}</small>` : ""}</td>
-      <td>${esc(b.kit)}${b.kit_loc ? `<br><small>at ${esc(hubName(b.kit_loc))}</small>` : ""}${kind === "drop" && b.fulfillment === "self" && b.hub && b.kit_loc && b.hub !== b.kit_loc ? `<br><b class="owed">move to ${esc(hubName(b.hub))}</b>` : ""}</td><td>${badge(b.status)}</td></tr>`;
+      <td>${esc(b.kit)}${b.clash ? `<br><b class="owed">Kit clash with ${isOwner ? `<a href="/admin/bookings/${b.clash.id}">#${b.clash.id}</a>` : `#${b.clash.id}`}</b>` : ""}${b.kit_loc ? `<br><small>at ${esc(hubName(b.kit_loc))}</small>` : ""}${kind === "drop" && b.fulfillment === "self" && b.hub && b.kit_loc && b.hub !== b.kit_loc ? `<br><b class="owed">move to ${esc(hubName(b.hub))}</b>` : ""}</td><td>${badge(b.status)}</td></tr>`;
   };
   const table = (rows, kind, empty) => rows.length
     ? `<table><thead><tr><th>Date</th><th>Customer</th><th>Address</th><th>Kit</th><th>Status</th></tr></thead><tbody>${rows.map((b) => stop(b, kind === "drop" ? b.delivery_date : b.pickup_date, kind)).join("")}</tbody></table>`
@@ -300,6 +302,7 @@ async function bookingView(db, who, id, flash, error = "") {
   const rr = rentalRefundInfo(b, pays);
   const t = today();
   const sAll = await getSettings(db);
+  const clash = await kitClash(db, b, sAll.buffer_days);
   const rrToday = rentalRefundInfo({ ...b, pickup_date: t }, pays);
   const canComplete = ["delivered", "pickup_requested"].includes(b.status);
   const priceItems = canComplete ? (await db.prepare("SELECT * FROM price_items WHERE active = 1 ORDER BY sort, name").all()).results : [];
@@ -342,7 +345,7 @@ async function bookingView(db, who, id, flash, error = "") {
         <dt>Address</dt><dd>${esc(deliveryAddr(b))}</dd>
         <dt>Plan</dt><dd>${esc(b.plan)}${b.addon_packs ? ` + ${b.addon_packs * ADDON_PACK_SIZE} extra totes (${b.addon_packs} pack${b.addon_packs > 1 ? "s" : ""})` : ""}</dd>
         <dt>Handoff</dt><dd>${b.fulfillment === "self" ? `Customer picks up at ${esc(hubName(b.hub))} hub` : "We deliver"} · return: ${b.return_method === "dropoff" ? `customer drops off at ${esc(hubName(b.hub))} hub` : `we pick up${b.pickup_address ? ` at <b>${esc(pickupAddr(b))}</b> (new address)` : ""}`}</dd>
-        <dt>Kit</dt><dd>${esc(b.kit)}${b.kit_loc ? ` <small>(kept at ${esc(hubName(b.kit_loc))})</small>` : ""}</dd>
+        <dt>Kit</dt><dd>${esc(b.kit)}${b.kit_loc ? ` <small>(kept at ${esc(hubName(b.kit_loc))})</small>` : ""}${clash ? `<br><b class="owed">Kit clash:</b> also booked by <a href="/admin/bookings/${clash.id}">#${clash.id} ${esc(clash.name)}</a> (delivery ${esc(niceDate(clash.delivery_date))}${clash.pickup_date ? `, pickup ${esc(niceDate(clash.pickup_date))}` : ", open-ended"}). Move one to another kit.` : ""}</dd>
         <dt>Delivery</dt><dd>${esc(niceDate(b.delivery_date))}, first thing in the morning</dd>
         <dt>Pickup</dt><dd>${b.pickup_date ? esc(niceDate(b.pickup_date)) : "Open-ended"}</dd>
         <dt>Est. return</dt><dd>${b.est_return_date ? esc(niceDate(b.est_return_date)) + " <small>(customer estimate)</small>" : "<span class='muted'>none</span>"}</dd>

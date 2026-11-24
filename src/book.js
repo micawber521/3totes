@@ -1,14 +1,13 @@
 // Customer online booking (/book) + PayPal webhook.
 // Hidden behind the `online_booking` setting; while off, /book?preview=<booking_preview_key> still works
 // so Christian can test end to end (sandbox).
-import { ensureSchema, getSettings, kitBlocks, freeKit, kitConflict, newToken, addonPacksAvailable, addonState, packsFree, ADDON_PACK_SIZE, HUBS, hubName, hubWhere, fmtAddr, deliveryAddr, pickupAddr } from "./db.js";
+import { ensureSchema, getSettings, kitBlocks, freeKit, kitConflict, newToken, addonPacksAvailable, addonState, packsFree, ADDON_PACK_SIZE, HUBS, hubName, hubWhere, fmtAddr, deliveryAddr, pickupAddr, WINDOW_DAYS, kitClash } from "./db.js";
 import { paypalReady, createRentalSubscription, getSubscription, verifyWebhook, firstRenewalDate } from "./paypal.js";
 import { trySend } from "./mail.js";
 import { cancelFee, customerCanCancel, cancelBooking, cancelPolicyText } from "./cancel.js";
 
 const TZ = "America/Chicago";
 const HOLD_MINUTES = 30;
-const WINDOW_DAYS = { moving: 14, storage: 30 }; // a kit must be free this long from the delivery day
 const LIMITS = { name: 100, email: 200, phone: 30, address: 200, address2: 50, city: 60, state: 20, notes: 1000 };
 
 const json = (status, obj) => Response.json(obj, { status, headers: { "cache-control": "no-store" } });
@@ -214,6 +213,19 @@ export async function confirmBooking(env, bookingId, billingStatus, by) {
   await db.prepare("INSERT INTO booking_events (booking_id, by_email, action, detail) VALUES (?, ?, 'confirmed', ?)")
     .bind(bookingId, by, `PayPal subscription ${billingStatus}`).run();
   await sendConfirmation(env, bookingId);
+  // Warn only: a late payment (after the hold ran out) can land on a kit someone else booked meanwhile.
+  try {
+    const b = await db.prepare(`SELECT b.*, c.name, k.label AS kit FROM bookings b JOIN customers c ON c.id = b.customer_id
+      JOIN kits k ON k.id = b.kit_id WHERE b.id = ?`).bind(bookingId).first();
+    const clash = await kitClash(db, b, (await getSettings(db)).buffer_days);
+    if (clash) {
+      const msg = `${b.kit} is also booked by #${clash.id} ${clash.name} (delivery ${clash.delivery_date}${clash.pickup_date ? `, pickup ${clash.pickup_date}` : ", open-ended"})`;
+      await db.prepare("INSERT INTO booking_events (booking_id, by_email, action, detail) VALUES (?, 'system', 'kit clash', ?)").bind(bookingId, msg).run();
+      const owner = ownerEmail(env);
+      if (owner) await trySend(env, { to: owner, fromName: "3totes bookings", subject: `KIT CLASH: booking #${b.id}, ${b.name}`,
+        text: `Booking #${b.id} (${b.name}, delivery ${b.delivery_date}) was just paid, but ${msg}.\n\nThe customer's payment went through and they got a normal confirmation. Put one of the two bookings on another kit (or build one) before delivery day.\n\nhttps://3totes.com/admin/bookings/${b.id}\nhttps://3totes.com/admin/bookings/${clash.id}\n` });
+    }
+  } catch (e) { console.error("kit clash check:", e && e.message); }
 }
 
 const myLink = (b) => `https://3totes.com/my/${b.manage_token}`;

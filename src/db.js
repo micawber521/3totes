@@ -246,6 +246,17 @@ export async function getSettings(db) {
 
 // Does kitId have another booking that overlaps [start, end]? end = null means open-ended.
 // A booking blocks its kit from delivery_date through pickup_date + buffer days (cleaning/turnaround).
+export const WINDOW_DAYS = { moving: 14, storage: 30 }; // a kit must be free this long from the delivery day
+
+// Is this booking's kit also promised to another live booking for overlapping dates? Uses the booking's pickup
+// date, or its minimum rental window when no pickup is set. Normally prevented at booking time; it can still happen
+// when a customer pays after their checkout hold ran out and someone else took the kit meanwhile.
+export async function kitClash(db, b, bufferDays) {
+  if (!["pending", "confirmed", "delivered", "pickup_requested"].includes(b.status)) return null;
+  const d = new Date(b.delivery_date + "T12:00:00Z"); d.setUTCDate(d.getUTCDate() + (WINDOW_DAYS[b.plan] || 14) - 1);
+  return kitConflict(db, { kitId: b.kit_id, start: b.delivery_date, end: b.pickup_date || d.toISOString().slice(0, 10), bufferDays, excludeId: b.id });
+}
+
 export async function kitConflict(db, { kitId, start, end, bufferDays, excludeId = 0 }) {
   const buf = `+${Number(bufferDays) || 0} days`;
   return db.prepare(
