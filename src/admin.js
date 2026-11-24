@@ -10,8 +10,17 @@ const TZ = "America/Chicago";
 const STATUSES = ["pending", "confirmed", "delivered", "pickup_requested", "returned", "closed", "cancelled"];
 const STATUS_LABEL = {
   pending: "Pending", confirmed: "Confirmed", delivered: "Delivered", pickup_requested: "Pickup requested",
-  returned: "Returned", closed: "Closed", cancelled: "Cancelled",
+  returned: "Returned", closed: "Closed", cancelled: "Cancelled", abandoned: "Unpaid (abandoned)",
 };
+// An online checkout saves the booking as 'pending' with a kit hold (hold_expires_at). Paying confirms it and clears
+// the hold. A hold that runs out unpaid is an abandoned checkout: still 'pending' in the table (the status CHECK
+// constraint can't take a new value without rebuilding it), shown as "Unpaid (abandoned)" and kept off the schedule.
+// Admin-created pending bookings have no hold and are never abandoned.
+const ABANDONED_SQL = "(b.status = 'pending' AND b.hold_expires_at IS NOT NULL AND b.hold_expires_at < datetime('now'))";
+const sqlNow = () => new Date().toISOString().replace("T", " ").slice(0, 19);   // same format as datetime('now')
+const isAbandoned = (b) => b.status === "pending" && !!b.hold_expires_at && b.hold_expires_at < sqlNow();
+const inCheckout = (b) => b.status === "pending" && !!b.hold_expires_at && b.hold_expires_at >= sqlNow();
+const shownStatus = (b) => isAbandoned(b) ? "abandoned" : b.status;
 const KIT_STATUSES = ["active", "cleaning", "retired"];
 const KIT_TOTES = 12; // totes in a kit; a split kit adds all of them to the extra-tote pool
 // charge for one price-list line: package items are replaced by the whole pack.
@@ -47,6 +56,7 @@ const addDays = (ymd, n) => { const d = new Date(ymd + "T12:00:00Z"); d.setUTCDa
 const isDate = (s) => /^\d{4}-\d{2}-\d{2}$/.test(s) && !Number.isNaN(Date.parse(s + "T12:00:00Z"));
 const niceDate = (ymd) => ymd ? new Date(ymd + "T12:00:00Z").toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric", timeZone: "UTC" }) : "";
 const badge = (s) => `<span class="badge s-${esc(s)}">${esc(STATUS_LABEL[s] || s)}</span>`;
+const minsLeft = (b) => Math.max(1, Math.ceil((Date.parse(b.hold_expires_at.replace(" ", "T") + "Z") - Date.now()) / 60000));
 
 function page(title, who, body, flash = "") {
   const nav = who.role === "owner"
@@ -111,7 +121,12 @@ async function schedule(db, who, flash) {
     `SELECT b.*, c.name, c.phone, k.label AS kit, k.location AS kit_loc FROM bookings b
        JOIN customers c ON c.id = b.customer_id JOIN kits k ON k.id = b.kit_id
       WHERE b.status IN ('pending','confirmed') AND b.delivery_date <= ?
+        AND NOT (b.status = 'pending' AND b.hold_expires_at IS NOT NULL)
       ORDER BY b.delivery_date, b.id`).bind(horizon).all()).results;
+  const checkouts = who.role === "owner" ? (await db.prepare(
+    `SELECT b.id, b.delivery_date, b.hold_expires_at, c.name FROM bookings b JOIN customers c ON c.id = b.customer_id
+      WHERE b.status = 'pending' AND b.hold_expires_at IS NOT NULL AND b.hold_expires_at >= datetime('now')
+      ORDER BY b.hold_expires_at`).all()).results : [];
   const pickups = (await db.prepare(
     `SELECT b.*, c.name, c.phone, k.label AS kit, k.location AS kit_loc FROM bookings b
        JOIN customers c ON c.id = b.customer_id JOIN kits k ON k.id = b.kit_id
@@ -142,6 +157,8 @@ async function schedule(db, who, flash) {
 
   return page("Schedule", who, `
     <p class="muted">Today is ${esc(niceDate(t))}. Drop-offs happen first thing in the morning on the delivery date. Showing the next 14 days.</p>
+    ${checkouts.length ? `<p class="checkout"><b>Checkout in progress, not paid yet:</b> ${checkouts.map((b) => `<a href="/admin/bookings/${b.id}">${esc(b.name)}</a> for ${esc(niceDate(b.delivery_date))} (kit held ${minsLeft(b)} more min)`).join("; ")}.
+      <small>It joins the drop-offs once paid. Unpaid ones drop off and show as abandoned on Bookings.</small></p>` : ""}
     <h2>Drop-offs</h2>${table(drops, "drop", "No drop-offs in the next 14 days.")}
     <h2>Pickups <small class="muted">(empty totes only)</small></h2>${table(pickups, "pick", "No pickups scheduled in the next 14 days.")}
     <h2>Out now</h2>${out.length
@@ -155,20 +172,26 @@ async function bookingList(db, who, url, flash) {
   const status = url.searchParams.get("status") || "";
   const q = (url.searchParams.get("q") || "").trim();
   const where = [], args = [];
-  if (STATUSES.includes(status)) { where.push("b.status = ?"); args.push(status); }
+  if (status === "abandoned") where.push(ABANDONED_SQL);
+  else if (status === "all") { /* everything, abandoned included */ }
+  else {
+    if (STATUSES.includes(status)) { where.push("b.status = ?"); args.push(status); }
+    where.push(`NOT ${ABANDONED_SQL}`);
+  }
   if (q) { where.push("(c.name LIKE ? OR c.phone LIKE ? OR c.email LIKE ? OR b.address LIKE ? OR b.city LIKE ?)"); args.push(...Array(5).fill(`%${q}%`)); }
   const rows = (await db.prepare(
-    `SELECT b.id, b.status, b.plan, b.delivery_date, b.pickup_date, b.address, b.address2, b.city, b.state, b.zip, c.name, k.label AS kit
+    `SELECT b.id, b.status, b.hold_expires_at, b.plan, b.delivery_date, b.pickup_date, b.address, b.address2, b.city, b.state, b.zip, c.name, k.label AS kit
        FROM bookings b JOIN customers c ON c.id = b.customer_id JOIN kits k ON k.id = b.kit_id
        ${where.length ? "WHERE " + where.join(" AND ") : ""}
       ORDER BY b.delivery_date DESC, b.id DESC LIMIT 200`).bind(...args).all()).results;
-  const opts = ["", ...STATUSES].map((s) => `<option value="${s}"${s === status ? " selected" : ""}>${s ? esc(STATUS_LABEL[s]) : "All statuses"}</option>`).join("");
+  const optLabel = { "": "All but abandoned", all: "All, incl. abandoned" };
+  const opts = ["", ...STATUSES, "abandoned", "all"].map((s) => `<option value="${s}"${s === status ? " selected" : ""}>${esc(optLabel[s] || STATUS_LABEL[s])}</option>`).join("");
   return page("Bookings", who, `
     <form class="filters" method="get"><input name="q" value="${esc(q)}" placeholder="Name, phone, email, address"><select name="status">${opts}</select><button>Filter</button>
       <a class="button" href="/admin/bookings/new">+ New booking</a></form>
     ${rows.length ? `<table><thead><tr><th>#</th><th>Customer</th><th>Plan</th><th>Delivery</th><th>Pickup</th><th>Kit</th><th>Status</th></tr></thead><tbody>
       ${rows.map((b) => `<tr><td><a href="/admin/bookings/${b.id}">${b.id}</a></td><td><a href="/admin/bookings/${b.id}">${esc(b.name)}</a><br><small>${esc(deliveryAddr(b))}</small></td>
-        <td>${esc(b.plan)}</td><td>${esc(niceDate(b.delivery_date))}</td><td>${b.pickup_date ? esc(niceDate(b.pickup_date)) : "<em>open</em>"}</td><td>${esc(b.kit)}</td><td>${badge(b.status)}</td></tr>`).join("")}
+        <td>${esc(b.plan)}</td><td>${esc(niceDate(b.delivery_date))}</td><td>${b.pickup_date ? esc(niceDate(b.pickup_date)) : "<em>open</em>"}</td><td>${esc(b.kit)}</td><td>${badge(shownStatus(b))}</td></tr>`).join("")}
       </tbody></table>` : `<p class="muted">No bookings found.</p>`}`, flash);
 }
 
@@ -313,7 +336,8 @@ async function bookingView(db, who, id, flash, error = "") {
     ${error ? `<p class="error">${esc(error)}</p>` : ""}
     <div class="cols">
       <section class="card"><h2>Details</h2><dl>
-        <dt>Status</dt><dd>${badge(b.status)}</dd>
+        <dt>Status</dt><dd>${badge(shownStatus(b))}${isAbandoned(b) ? `<br><small>Checkout started but never paid. The kit hold ended ${esc(b.hold_expires_at)} UTC; it's not on the schedule and the kit is free.</small>`
+          : inCheckout(b) ? `<br><small>Customer is at checkout. Kit held ${minsLeft(b)} more min; not on the schedule until paid.</small>` : ""}</dd>
         <dt>Customer</dt><dd>${esc(b.name)}<br>${esc(b.phone || "")}${b.email ? `<br><a href="mailto:${esc(b.email)}">${esc(b.email)}</a>` : ""}</dd>
         <dt>Address</dt><dd>${esc(deliveryAddr(b))}</dd>
         <dt>Plan</dt><dd>${esc(b.plan)}${b.addon_packs ? ` + ${b.addon_packs * ADDON_PACK_SIZE} extra totes (${b.addon_packs} pack${b.addon_packs > 1 ? "s" : ""})` : ""}</dd>
@@ -411,7 +435,7 @@ async function kitsPage(db, who, flash) {
             (SELECT COALESCE(b.pickup_date, '~' || b.est_return_date) FROM bookings b
               WHERE b.kit_id = k.id AND b.status IN ('delivered','pickup_requested') LIMIT 1) AS back,
             (SELECT MIN(b.delivery_date) FROM bookings b
-              WHERE b.kit_id = k.id AND b.status IN ('pending','confirmed') AND b.delivery_date >= ?) AS next_drop
+              WHERE b.kit_id = k.id AND b.status IN ('pending','confirmed') AND b.delivery_date >= ? AND NOT ${ABANDONED_SQL}) AS next_drop
        FROM kits k ORDER BY k.status = 'retired', k.label`).bind(t).all()).results;
   return page("Kits", who, `
     <p class="muted">Need to break up a kit for an extra-tote order? Check <b>Split for extras</b>. That kit can't be booked while it's split,
@@ -836,7 +860,7 @@ table{width:100%;border-collapse:collapse;background:var(--card);border:1px soli
 th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}th{font-size:.8rem;text-transform:uppercase;letter-spacing:.03em;color:var(--muted)}
 tr.today td{background:#fff8d6}tr.late td{background:#fde8e6}
 .badge{display:inline-block;padding:1px 8px;border-radius:999px;font-size:.8rem;background:#eee;white-space:nowrap}
-.s-confirmed{background:#e3f0ff}.s-pending{background:#fff3c4}.s-delivered{background:#dff5e1}.s-pickup_requested{background:#ffe2c4}.s-returned,.s-closed{background:#eee}.s-cancelled{background:#f3d6d3}
+.s-confirmed{background:#e3f0ff}.s-pending{background:#fff3c4}.s-delivered{background:#dff5e1}.s-pickup_requested{background:#ffe2c4}.s-returned,.s-closed{background:#eee}.s-cancelled{background:#f3d6d3}.s-abandoned{background:#eee;color:#666}.checkout{background:#fff8dc;border:1px solid #f0e0a0;padding:8px 12px;border-radius:6px}
 .flash{background:#dff5e1;padding:8px 12px;border-radius:6px}.error{background:#fde8e6;color:var(--red);padding:8px 12px;border-radius:6px}
 form.grid{display:grid;gap:12px}form.grid.narrow{max-width:420px}fieldset{border:1px solid var(--line);border-radius:8px;padding:12px;display:grid;gap:10px;background:var(--card)}
 label{display:grid;gap:4px;font-size:.9rem;min-width:0}input,select,textarea{font:inherit;padding:7px 9px;border:1px solid #bbb;border-radius:6px;background:#fff;width:100%}
