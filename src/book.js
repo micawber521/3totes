@@ -1,7 +1,7 @@
 // Customer online booking (/book) + PayPal webhook.
 // Hidden behind the `online_booking` setting; while off, /book?preview=<booking_preview_key> still works
 // so Christian can test end to end (sandbox).
-import { ensureSchema, getSettings, kitBlocks, freeKit, kitConflict, newToken, addonPacksAvailable, addonState, packsFree, ADDON_PACK_SIZE, HUBS, hubName, hubWhere } from "./db.js";
+import { ensureSchema, getSettings, kitBlocks, freeKit, kitConflict, newToken, addonPacksAvailable, addonState, packsFree, ADDON_PACK_SIZE, HUBS, hubName, hubWhere, fmtAddr, deliveryAddr, pickupAddr } from "./db.js";
 import { paypalReady, createRentalSubscription, getSubscription, verifyWebhook, firstRenewalDate } from "./paypal.js";
 import { trySend } from "./mail.js";
 import { cancelFee, customerCanCancel, cancelBooking, cancelPolicyText } from "./cancel.js";
@@ -9,7 +9,7 @@ import { cancelFee, customerCanCancel, cancelBooking, cancelPolicyText } from ".
 const TZ = "America/Chicago";
 const HOLD_MINUTES = 30;
 const WINDOW_DAYS = { moving: 14, storage: 30 }; // a kit must be free this long from the delivery day
-const LIMITS = { name: 100, email: 200, phone: 30, address: 200, notes: 1000 };
+const LIMITS = { name: 100, email: 200, phone: 30, address: 200, address2: 50, city: 60, state: 20, notes: 1000 };
 
 const json = (status, obj) => Response.json(obj, { status, headers: { "cache-control": "no-store" } });
 const money = (c) => "$" + (Number(c || 0) / 100).toFixed(2);
@@ -120,7 +120,7 @@ async function start(request, env, s, url) {
   const b = await request.json().catch(() => null);
   if (!b) return json(400, { ok: false, msg: "Bad request" });
   const v = {};
-  for (const k of ["zip", "plan", "date", "est_return", "name", "phone", "email", "address", "notes", "signed_name", "fulfillment", "hub"]) v[k] = String(b[k] ?? "").trim();
+  for (const k of ["zip", "plan", "date", "est_return", "name", "phone", "email", "address", "address2", "city", "state", "notes", "signed_name", "fulfillment", "hub"]) v[k] = String(b[k] ?? "").trim();
   const self = v.fulfillment === "self";
   if (self && !HUBS[v.hub]) return json(400, { ok: false, msg: "Pick which hub you'll get the kit from." });
   const packs = Number(b.addons || 0);
@@ -133,7 +133,7 @@ async function start(request, env, s, url) {
   if (!isDate(v.date)) return json(400, { ok: false, msg: "Pick a delivery day." });
   if (v.est_return && (!isDate(v.est_return) || v.est_return <= v.date || v.est_return > addDays(v.date, 365)))
     return json(400, { ok: false, msg: "Your estimated pickup date should be after the delivery day." });
-  if (!v.name || !v.phone || !v.email || !v.address) return json(400, { ok: false, msg: "Please fill in your name, phone, email and address." });
+  if (!v.name || !v.phone || !v.email || !v.address || !v.city || !v.state) return json(400, { ok: false, msg: "Please fill in your name, phone, email, street address, city and state." });
   for (const k of Object.keys(LIMITS)) if (v[k].length > LIMITS[k]) return json(400, { ok: false, msg: `That ${k} is too long.` });
   if (!emailOk(v.email)) return json(400, { ok: false, msg: "Please enter a valid email address." });
   if (b.agree !== true || v.signed_name.length < 2) return json(400, { ok: false, msg: "Please read the rental agreement, check the box and type your name to sign." });
@@ -157,11 +157,11 @@ async function start(request, env, s, url) {
 
   const ip = request.headers.get("CF-Connecting-IP") || "";
   const booking = await db.prepare(
-    `INSERT INTO bookings (customer_id, kit_id, plan, status, address, zip, delivery_date, notes, deposit_cents, delivery_fee_cents,
+    `INSERT INTO bookings (customer_id, kit_id, plan, status, address, address2, city, state, zip, delivery_date, notes, deposit_cents, delivery_fee_cents,
        rate_first_cents, rate_recurring_cents, agreement_version, signed_name, signed_at, signed_ip, source, hold_expires_at,
        est_return_date, manage_token, fulfillment, addon_packs, return_method, hub)
-     VALUES (?, ?, ?, 'pending', ?, ?, ?, NULLIF(?, ''), ?, ?, ?, ?, ?, ?, datetime('now'), ?, 'online', datetime('now', ?), NULLIF(?, ''), ?, ?, ?, ?, ?) RETURNING id`)
-    .bind(customer.id, kitId, v.plan, v.address, v.zip, v.date, v.notes, deposit, zone.delivery_fee_cents, r.first, r.recurring,
+     VALUES (?, ?, ?, 'pending', ?, NULLIF(?, ''), ?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?, ?, ?, ?, datetime('now'), ?, 'online', datetime('now', ?), NULLIF(?, ''), ?, ?, ?, ?, ?) RETURNING id`)
+    .bind(customer.id, kitId, v.plan, v.address, v.address2, v.city, v.state, v.zip, v.date, v.notes, deposit, zone.delivery_fee_cents, r.first, r.recurring,
       s.agreement_version || null, v.signed_name, ip, `+${HOLD_MINUTES} minutes`, v.est_return, newToken(),
       self ? "self" : "delivery", packs, self ? "dropoff" : "pickup", self ? v.hub : null).first();
 
@@ -231,7 +231,7 @@ Your tote rental is booked. Booking #${b.id}.
 
 ${isSelf(b)
   ? `PICK UP YOUR KIT: ${niceDate(b.delivery_date)} at our ${hubWhere(b.hub)}. ${(await getSettings(env.DB)).pickup_location_text || ""}\nWhen you're done, bring it back to one of our hubs (free).`
-  : `DELIVERY: ${niceDate(b.delivery_date)}, first thing in the morning\nADDRESS: ${b.address}, ${b.zip}`}${b.est_return_date ? `\nYOUR ESTIMATED PICKUP: ${niceDate(b.est_return_date)} (just an estimate, change it anytime)` : ""}
+  : `DELIVERY: ${niceDate(b.delivery_date)}, first thing in the morning\nADDRESS: ${deliveryAddr(b)}`}${b.est_return_date ? `\nYOUR ESTIMATED PICKUP: ${niceDate(b.est_return_date)} (just an estimate, change it anytime)` : ""}
 
 ${planLine}
 Paid today: ${money(b.deposit_cents + b.rate_first_cents + b.delivery_fee_cents)} = ${money(b.deposit_cents)} refundable deposit + ${money(b.rate_first_cents)} ${b.plan === "moving" ? "first 2 weeks" : "first month"}${b.delivery_fee_cents ? ` + ${money(b.delivery_fee_cents)} delivery` : ""}.
@@ -259,7 +259,7 @@ Totes Totes Totes
     replyTo: owner ? `<${owner}>` : undefined });
   if (owner) await trySend(env, { to: owner, fromName: "3totes bookings",
     subject: `New booking #${b.id}: ${b.name}, ${b.delivery_date}`,
-    text: `New online booking #${b.id}\n\n${b.name} | ${b.phone} | ${b.email}\n${b.address}, ${b.zip}\nPlan: ${b.plan}\nDelivery: ${niceDate(b.delivery_date)}\nEstimated pickup: ${b.est_return_date ? niceDate(b.est_return_date) : "-"}\nNotes: ${b.notes || "-"}\n\nhttps://3totes.com/admin/bookings/${b.id}\n` });
+    text: `New online booking #${b.id}\n\n${b.name} | ${b.phone} | ${b.email}\n${deliveryAddr(b)}\nPlan: ${b.plan}\nDelivery: ${niceDate(b.delivery_date)}\nEstimated pickup: ${b.est_return_date ? niceDate(b.est_return_date) : "-"}\nNotes: ${b.notes || "-"}\n\nhttps://3totes.com/admin/bookings/${b.id}\n` });
 }
 
 // ---------- PayPal webhook ----------
@@ -362,7 +362,7 @@ async function myPage(env, s, token, url) {
   const pickupBlock = b.pickup_date
     ? dropoff
       ? `<p class="big">Drop-off: <b>${esc(niceDate(b.pickup_date))}</b> at our ${esc(hubWhere(b.hub))}</p><p class="muted">${esc(s.pickup_location_text || "")} Please bring everything back with the totes <b>empty</b>.</p>`
-      : `<p class="big">Pickup: <b>${esc(niceDate(b.pickup_date))}</b><br><small>${esc(b.pickup_address || b.address)}, ${esc(b.pickup_zip || b.zip)}</small></p><p class="muted">Please have all totes <b>empty</b> and everything together by morning. We pick up the empty totes and equipment; we don't move your belongings.</p>`
+      : `<p class="big">Pickup: <b>${esc(niceDate(b.pickup_date))}</b><br><small>${esc(pickupAddr(b))}</small></p><p class="muted">Please have all totes <b>empty</b> and everything together by morning. We pick up the empty totes and equipment; we don't move your belongings.</p>`
     : `<p>Nothing scheduled yet. When you're done, tell us where to pick up the kit, or bring it back to us yourself.</p>`;
   return new Response(`${PAGE_HEAD("Your booking | Totes Totes Totes")}
 <main class="narrow">
@@ -372,7 +372,7 @@ async function myPage(env, s, token, url) {
   <section class="card"><h2>Booking #${b.id}</h2>
     <p>Status: <b>${esc(MY_STATUS[b.status] || b.status)}</b></p>
     ${isSelf(b) ? `<p>You pick up the kit: ${esc(niceDate(b.delivery_date))} at our ${esc(hubWhere(b.hub))}<br><small>${esc(s.pickup_location_text || "")}</small></p>`
-      : `<p>Delivery: ${esc(niceDate(b.delivery_date))}, first thing in the morning<br>${esc(b.address)}, ${esc(b.zip)}</p>`}
+      : `<p>Delivery: ${esc(niceDate(b.delivery_date))}, first thing in the morning<br>${esc(deliveryAddr(b))}</p>`}
     ${b.addon_packs ? `<p>Extra totes: ${b.addon_packs * ADDON_PACK_SIZE} (${b.addon_packs} pack${b.addon_packs > 1 ? "s" : ""} of ${ADDON_PACK_SIZE})</p>` : ""}
     ${b.rate_recurring_cents ? `<p class="muted">${esc(planLine)}</p>` : ""}
     <p>Refundable deposit: <b>${money(b.deposit_cents)}</b>${b.deposit_settled_at
@@ -385,8 +385,14 @@ async function myPage(env, s, token, url) {
     ${editable ? `<form id="pick">
         <label class="choice"><input type="radio" name="method" value="pickup"${dropoff ? "" : " checked"}> <span><b>Pick it up from me</b> (free, inside our service area)</span></label>
         <div id="pick-addr"${dropoff ? " hidden" : ""}>
-          <label>Pickup address <small>(moved? enter your new address)</small> <input id="pick-address" maxlength="200" value="${esc(b.pickup_address || b.address)}"></label>
-          <label>Zip <input id="pick-zip" inputmode="numeric" maxlength="5" value="${esc(b.pickup_zip || b.zip)}"></label>
+          <p class="muted">Pickup address <small>(moved? enter your new address)</small></p>
+          ${(() => { const p = b.pickup_address ? { a: b.pickup_address, a2: b.pickup_address2, c: b.pickup_city, s: b.pickup_state, z: b.pickup_zip || b.zip }
+              : { a: b.address, a2: b.address2, c: b.city, s: b.state, z: b.zip };
+            return `<label>Street address <input id="pick-address" maxlength="200" autocomplete="address-line1" value="${esc(p.a)}"></label>
+          <label>Apt / unit <small>(optional)</small> <input id="pick-address2" maxlength="50" autocomplete="address-line2" value="${esc(p.a2 || "")}"></label>
+          <div class="addr-row"><label>City <input id="pick-city" maxlength="60" autocomplete="address-level2" value="${esc(p.c || "")}"></label>
+          <label>State <input id="pick-state" maxlength="20" autocomplete="address-level1" value="${esc(p.s || "")}"></label>
+          <label>Zip <input id="pick-zip" inputmode="numeric" maxlength="5" autocomplete="postal-code" value="${esc(p.z)}"></label></div>`; })()}
         </div>
         <label class="choice"><input type="radio" name="method" value="dropoff"${dropoff ? " checked" : ""}> <span><b>I'll return it to a hub</b> (free). <small>Required if you're moving outside our service area.</small></span></label>
         <div id="pick-hub"${dropoff ? "" : " hidden"}><label>Which hub? <select id="hub">${Object.entries(HUBS).map(([k, n]) => `<option value="${k}"${(b.hub || Object.keys(HUBS)[0]) === k ? " selected" : ""}>${esc(n)}</option>`).join("")}</select></label></div>
@@ -418,7 +424,7 @@ async function myPage(env, s, token, url) {
   document.querySelectorAll("input[name=method]").forEach((r) => r.addEventListener("change", () => { const d = r.value === "dropoff" && r.checked; $("pick-addr").hidden = d; $("pick-hub").hidden = !d; }));
   $("pick") && $("pick").addEventListener("submit", (e) => { e.preventDefault();
     const m = document.querySelector("input[name=method]:checked").value;
-    post("pickup", { date: $("pick-date").value, method: m, address: $("pick-address").value, zip: $("pick-zip").value, hub: $("hub").value }, "pick-msg"); });
+    post("pickup", { date: $("pick-date").value, method: m, address: $("pick-address").value, address2: $("pick-address2").value, city: $("pick-city").value, state: $("pick-state").value, zip: $("pick-zip").value, hub: $("hub").value }, "pick-msg"); });
   $("unpick") && $("unpick").addEventListener("click", () => { if (confirm("Cancel your pickup request?")) post("cancel_pickup", {}, "pick-msg"); });
   $("est") && $("est").addEventListener("submit", (e) => { e.preventDefault(); post("estimate", { date: $("est-date").value }, "est-msg"); });
   $("cancel-booking") && $("cancel-booking").addEventListener("click", (e) => { if (confirm("Cancel your booking? The cancellation fee is " + e.target.dataset.fee + ".")) post("cancel_booking", {}, "cancel-msg"); });
@@ -466,29 +472,35 @@ async function myAction(request, env, s, token, action) {
   const method = body.method === "dropoff" ? "dropoff" : "pickup";
   const hub = HUBS[body.hub] ? body.hub : (HUBS[b.hub] ? b.hub : Object.keys(HUBS)[0]);
   // Default to the address already on file (pickup address if they moved, else delivery address).
-  const addr = String(body.address || b.pickup_address || b.address || "").trim().slice(0, 200), zip = String(body.zip || b.pickup_zip || b.zip || "").trim();
+  // The form always sends every part, so take them together (a cleared Apt / unit stays cleared).
+  const t = (x, n) => String(x ?? "").trim().slice(0, n);
+  const pa = body.address !== undefined
+    ? { a: t(body.address, 200), a2: t(body.address2, 50), c: t(body.city, 60), s: t(body.state, 20), z: t(body.zip, 5) }
+    : b.pickup_address ? { a: b.pickup_address, a2: b.pickup_address2 || "", c: b.pickup_city || "", s: b.pickup_state || "", z: b.pickup_zip || b.zip }
+    : { a: b.address, a2: b.address2 || "", c: b.city || "", s: b.state || "", z: b.zip };
+  const zip = pa.z, addr = fmtAddr(pa.a, pa.a2, pa.c, pa.s, pa.z);
   const min = earliestPickup(b, s);
   if (!isDate(date)) return json(400, { ok: false, msg: "Pick a day." });
   if (date < min) return json(400, { ok: false, msg: `The earliest day is ${niceDate(min)}.` });
   if (date > addDays(today(), 365)) return json(400, { ok: false, msg: "Pick a day within the next year." });
   if (method === "pickup") {
-    if (!addr || !/^\d{5}$/.test(zip)) return json(400, { ok: false, msg: "Enter the pickup address and a 5-digit zip." });
+    if (!pa.a || !pa.c || !pa.s || !/^\d{5}$/.test(zip)) return json(400, { ok: false, msg: "Enter the pickup street address, city, state and a 5-digit zip." });
     const inArea = await db.prepare("SELECT 1 FROM zones WHERE zip = ?").bind(zip).first();
     if (!inArea) return json(400, { ok: false, msg: "That address is outside our service area, so we can't pick up there. Please choose \"I'll return it to a hub\" and drop the kit off at our Sikeston or Jackson hub before you leave." });
   }
   const label = method === "dropoff" ? "drop-off" : "pickup";
-  await db.prepare(`UPDATE bookings SET pickup_date = ?, est_return_date = ?, return_method = ?, pickup_address = ?, pickup_zip = ?,
+  await db.prepare(`UPDATE bookings SET pickup_date = ?, est_return_date = ?, return_method = ?, pickup_address = ?, pickup_address2 = NULLIF(?, ''), pickup_city = ?, pickup_state = ?, pickup_zip = ?,
     hub = CASE WHEN ? = 'dropoff' THEN ? ELSE hub END,
     status = CASE WHEN status = 'delivered' THEN 'pickup_requested' ELSE status END, updated_at = datetime('now') WHERE id = ?`)
-    .bind(date, date, method, method === "pickup" ? addr : null, method === "pickup" ? zip : null, method, hub, b.id).run();
-  await log("pickup", `${b.pickup_date ? `customer changed to ${label}` : `customer scheduled ${label}`} ${date}${method === "pickup" ? ` at ${addr}, ${zip}` : ` at ${hubName(hub)} hub`}`);
-  const where = method === "pickup" ? `We'll pick up at: ${addr}, ${zip}\n\nPlease have all totes EMPTY and everything together by morning.\nWe pick up the empty totes and equipment; we don't move your belongings.`
+    .bind(date, date, method, ...(method === "pickup" ? [pa.a, pa.a2, pa.c, pa.s, zip] : [null, "", null, null, null]), method, hub, b.id).run();
+  await log("pickup", `${b.pickup_date ? `customer changed to ${label}` : `customer scheduled ${label}`} ${date}${method === "pickup" ? ` at ${addr}` : ` at ${hubName(hub)} hub`}`);
+  const where = method === "pickup" ? `We'll pick up at: ${addr}\n\nPlease have all totes EMPTY and everything together by morning.\nWe pick up the empty totes and equipment; we don't move your belongings.`
     : `Please bring the kit to our ${hubWhere(hub)} that day. ${s.pickup_location_text || ""}\nTotes should be EMPTY.`;
   const items = `12 totes with lids${b.addon_packs ? ` + ${b.addon_packs * ADDON_PACK_SIZE} extra totes` : ""}, the hand truck, moving blankets, furniture sliders, lifting straps and load straps.`;
   await trySend(env, { to: b.email, subject: `${label === "pickup" ? "Pickup" : "Drop-off"} scheduled: ${niceDate(date)}`, replyTo: owner ? `<${owner}>` : undefined,
     text: `Hi ${b.name},\n\nYour ${label} is scheduled for ${niceDate(date)}.\n\n${where}\n\nWhat comes back: ${items}\n\nNeed to change it? ${myLink(b)}\n\nThanks!\nTotes Totes Totes\n` });
   if (owner) await trySend(env, { to: owner, fromName: "3totes bookings", subject: `${label === "pickup" ? "Pickup" : "Drop-off"} ${b.pickup_date ? "changed" : "scheduled"}: ${date}, booking #${b.id}`,
-    text: `${b.name}: ${label} on ${niceDate(date)}.\n${method === "pickup" ? `${addr}, ${zip}` : `Customer is bringing it to the ${hubName(hub)} hub.`} | ${b.phone}\n\nhttps://3totes.com/admin/bookings/${b.id}\n` });
+    text: `${b.name}: ${label} on ${niceDate(date)}.\n${method === "pickup" ? addr : `Customer is bringing it to the ${hubName(hub)} hub.`} | ${b.phone}\n\nhttps://3totes.com/admin/bookings/${b.id}\n` });
   return json(200, { ok: true, msg: `${label === "pickup" ? "Pickup" : `Drop-off at our ${hubName(hub)} hub`} scheduled for ${niceDate(date)}. We sent you a confirmation email.` });
 }
 
@@ -580,7 +592,12 @@ ${preview ? `<div class="banner">PREVIEW: online booking is OFF. Payments use th
     <label>Name <input id="name" maxlength="100" autocomplete="name" required></label>
     <label>Phone <input id="phone" type="tel" maxlength="30" autocomplete="tel" required></label>
     <label>Email <input id="email" type="email" maxlength="200" autocomplete="email" required></label>
-    <label><span id="addr-label">Delivery address</span> <input id="address" maxlength="200" autocomplete="street-address" required></label>
+    <p class="addr-head"><b id="addr-label">Delivery address</b></p>
+    <label>Street address <input id="address" maxlength="200" autocomplete="address-line1" placeholder="123 Main St" required></label>
+    <label>Apt / unit <small>(optional)</small> <input id="address2" maxlength="50" autocomplete="address-line2"></label>
+    <div class="addr-row"><label>City <input id="city" maxlength="60" autocomplete="address-level2" required></label>
+    <label>State <input id="state" maxlength="20" autocomplete="address-level1" required></label>
+    <label>Zip <input id="zip2" readonly tabindex="-1" title="From step 1. Change it there."></label></div>
     <label>Notes for the driver <small>(optional: gate code, where to leave the kit)</small> <textarea id="notes" maxlength="1000"></textarea></label>
   </section>
 
@@ -625,7 +642,7 @@ $("zip").addEventListener("input", async (e) => {
   if (z.length !== 5) return;
   const r = await fetch(api("zip", "zip=" + z)).then((r) => r.json()).catch(() => ({}));
   if (!r.ok) return msg("zip-msg", r.msg || "Something went wrong.", true);
-  st.zip = z; st.served = r.served; st.zoneFee = r.served ? r.fee_cents : 0;
+  st.zip = z; $("zip2").value = z; st.served = r.served; st.zoneFee = r.served ? r.fee_cents : 0;
   $("ful").hidden = false;
   const del = document.querySelector("input[name=ful][value=delivery]"), self = document.querySelector("input[name=ful][value=self]");
   del.disabled = !r.served; $("ful-del-wrap").classList.toggle("off", !r.served);
@@ -730,13 +747,13 @@ function summary() {
 }
 function form() {
   return { zip: st.zip, fulfillment: st.ful, hub: $("hub").value, addons: Number($("addons").value) || 0, plan: st.plan, date: st.date, est_return: $("est").value, name: $("name").value, phone: $("phone").value, email: $("email").value,
-    address: $("address").value, notes: $("notes").value, agree: $("agree").checked, signed_name: $("signed").value };
+    address: $("address").value, address2: $("address2").value, city: $("city").value, state: $("state").value, notes: $("notes").value, agree: $("agree").checked, signed_name: $("signed").value };
 }
 function check() {
   const v = form();
   if (!st.ful) return "Choose delivery or pickup.";
   if (!v.date) return "Pick a day.";
-  if (!v.name.trim() || !v.phone.trim() || !v.email.trim() || !v.address.trim()) return "Please fill in your name, phone, email and address.";
+  if (!v.name.trim() || !v.phone.trim() || !v.email.trim() || !v.address.trim() || !v.city.trim() || !v.state.trim()) return "Please fill in your name, phone, email, street address, city and state.";
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v.email.trim())) return "Please enter a valid email address.";
   if (!v.agree || v.signed_name.trim().length < 2) return "Please check the agreement box and type your name to sign.";
   return "";
@@ -787,7 +804,7 @@ h1{font-size:clamp(1.8rem,6vw,2.4rem);margin:.3em 0}.lede{color:var(--muted)}
 label{display:grid;gap:4px;margin:10px 0;font-size:.95rem}label.choice{display:flex;gap:10px;align-items:baseline;cursor:pointer}
 input:not([type=radio]):not([type=checkbox]),textarea,select{font:inherit;padding:10px 12px;border:1px solid #bbb;border-radius:8px;width:100%;background:#fff}
 textarea{min-height:80px}button{font:inherit;font-weight:600;padding:10px 16px;border:0;border-radius:8px;background:var(--yellow);color:var(--ink);cursor:pointer}
-.row{display:flex;gap:8px}label.off{opacity:.5}.muted,small{color:var(--muted)}.msg{min-height:1.2em;margin:6px 0 0}.msg.err{color:var(--red)}
+.row{display:flex;gap:8px}.addr-row{display:grid;grid-template-columns:2fr 1fr 1fr;gap:10px}.addr-row>label{min-width:0}.addr-head{margin:6px 0 -4px}#zip2{background:#f1f1ec;color:var(--muted)}@media (max-width:480px){.addr-row{grid-template-columns:1fr 1fr}.addr-row>label:first-child{grid-column:1/-1}}label.off{opacity:.5}.muted,small{color:var(--muted)}.msg{min-height:1.2em;margin:6px 0 0}.msg.err{color:var(--red)}
 .calnav{display:flex;align-items:center;justify-content:space-between;margin:4px 0 8px}.calnav b{font-size:1.05rem}
 .calnav button{width:40px;height:36px;padding:0;font-size:1.4rem;line-height:1;background:#fff;border:1.5px solid var(--ink)}.calnav button:disabled{opacity:.25;cursor:default}
 .cal{display:grid;grid-template-columns:repeat(7,1fr);gap:4px;text-align:center}.cal b{font-size:.8rem;color:var(--muted)}

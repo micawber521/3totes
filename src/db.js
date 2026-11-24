@@ -190,7 +190,29 @@ const MIGRATIONS = [
     `ALTER TABLE kits ADD COLUMN location TEXT`,   // locations (hubs table) key where the kit is kept
     `UPDATE kits SET location = 'sikeston' WHERE location IS NULL`,
   ]],
+  [15, [
+    // Address split into parts. address / pickup_address keep the street line; older bookings have the
+    // whole address in that one column with these left NULL, and display the same either way.
+    `ALTER TABLE bookings ADD COLUMN address2 TEXT`,          // apt / unit (optional)
+    `ALTER TABLE bookings ADD COLUMN city TEXT`,
+    `ALTER TABLE bookings ADD COLUMN state TEXT`,
+    `ALTER TABLE bookings ADD COLUMN pickup_address2 TEXT`,
+    `ALTER TABLE bookings ADD COLUMN pickup_city TEXT`,
+    `ALTER TABLE bookings ADD COLUMN pickup_state TEXT`,
+  ]],
 ];
+
+// One-line address from its parts: "12 Main St, Apt 3, Jackson, MO 63755". Missing parts are skipped.
+export function fmtAddr(street, unit, city, state, zip) {
+  const clean = (x) => String(x ?? "").trim();
+  const line1 = [street, unit].map(clean).filter(Boolean).join(", ");
+  const tail = [clean(state), clean(zip)].filter(Boolean).join(" ");
+  return [line1, clean(city), tail].filter(Boolean).join(", ");
+}
+export const deliveryAddr = (b) => fmtAddr(b.address, b.address2, b.city, b.state, b.zip);
+// Where we collect: the pickup address if they moved, else the delivery address.
+export const pickupAddr = (b) => b.pickup_address
+  ? fmtAddr(b.pickup_address, b.pickup_address2, b.pickup_city, b.pickup_state, b.pickup_zip || b.zip) : deliveryAddr(b);
 
 let ready = false;
 

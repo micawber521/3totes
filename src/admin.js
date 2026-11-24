@@ -1,7 +1,7 @@
 // /admin: server-rendered pages for Christian (owner) and drivers.
 // Step 1 of BOOKING_DESIGN: kits, manual bookings, schedule, settings. No payments yet.
 import { adminIdentity } from "./access.js";
-import { ensureSchema, getSettings, kitConflict, newToken, addonPacksAvailable, ADDON_PACK_SIZE, HUBS, hubName, allHubs } from "./db.js";
+import { ensureSchema, getSettings, kitConflict, newToken, addonPacksAvailable, ADDON_PACK_SIZE, HUBS, hubName, allHubs, deliveryAddr, pickupAddr } from "./db.js";
 import { paypalReady, refundSale, cancelSubscription } from "./paypal.js";
 import { trySend } from "./mail.js";
 import { cancelFee, cancelBooking } from "./cancel.js";
@@ -128,12 +128,12 @@ async function schedule(db, who, flash) {
     const late = date && date < t;
     const name = isOwner ? `<a href="/admin/bookings/${b.id}">${esc(b.name)}</a>` : esc(b.name);
     const atUs = (kind === "drop" && b.fulfillment === "self") || (kind === "pick" && b.return_method === "dropoff");
-    const addr = kind === "pick" && b.pickup_address ? b.pickup_address : b.address, zip = kind === "pick" && b.pickup_zip ? b.pickup_zip : b.zip;
-    const map = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(addr + " " + zip)}`;
+    const addr = kind === "pick" ? pickupAddr(b) : deliveryAddr(b);
+    const map = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(addr)}`;
     return `<tr class="${late ? "late" : date === t ? "today" : ""}">
       <td>${date ? esc(niceDate(date)) : "<em>no date</em>"}${late ? " <b>overdue</b>" : ""}</td>
       <td>${name}<br><small>${esc(b.phone || "")}</small></td>
-      <td>${atUs ? `<b>${kind === "drop" ? `Customer picks up at ${esc(hubName(b.hub))} hub` : `Customer drops off at ${esc(hubName(b.hub))} hub`}</b>` : `<a href="${esc(map)}" target="_blank" rel="noopener">${esc(addr)}, ${esc(zip)}</a>${kind === "pick" && b.pickup_address ? " <small>(new address)</small>" : ""}`}${b.addon_packs ? `<br><small>+${b.addon_packs * ADDON_PACK_SIZE} extra totes</small>` : ""}${b.notes ? `<br><small>${esc(b.notes)}</small>` : ""}</td>
+      <td>${atUs ? `<b>${kind === "drop" ? `Customer picks up at ${esc(hubName(b.hub))} hub` : `Customer drops off at ${esc(hubName(b.hub))} hub`}</b>` : `<a href="${esc(map)}" target="_blank" rel="noopener">${esc(addr)}</a>${kind === "pick" && b.pickup_address ? " <small>(new address)</small>" : ""}`}${b.addon_packs ? `<br><small>+${b.addon_packs * ADDON_PACK_SIZE} extra totes</small>` : ""}${b.notes ? `<br><small>${esc(b.notes)}</small>` : ""}</td>
       <td>${esc(b.kit)}${b.kit_loc ? `<br><small>at ${esc(hubName(b.kit_loc))}</small>` : ""}${kind === "drop" && b.fulfillment === "self" && b.hub && b.kit_loc && b.hub !== b.kit_loc ? `<br><b class="owed">move to ${esc(hubName(b.hub))}</b>` : ""}</td><td>${badge(b.status)}</td></tr>`;
   };
   const table = (rows, kind, empty) => rows.length
@@ -156,9 +156,9 @@ async function bookingList(db, who, url, flash) {
   const q = (url.searchParams.get("q") || "").trim();
   const where = [], args = [];
   if (STATUSES.includes(status)) { where.push("b.status = ?"); args.push(status); }
-  if (q) { where.push("(c.name LIKE ? OR c.phone LIKE ? OR c.email LIKE ? OR b.address LIKE ?)"); args.push(...Array(4).fill(`%${q}%`)); }
+  if (q) { where.push("(c.name LIKE ? OR c.phone LIKE ? OR c.email LIKE ? OR b.address LIKE ? OR b.city LIKE ?)"); args.push(...Array(5).fill(`%${q}%`)); }
   const rows = (await db.prepare(
-    `SELECT b.id, b.status, b.plan, b.delivery_date, b.pickup_date, b.address, c.name, k.label AS kit
+    `SELECT b.id, b.status, b.plan, b.delivery_date, b.pickup_date, b.address, b.address2, b.city, b.state, b.zip, c.name, k.label AS kit
        FROM bookings b JOIN customers c ON c.id = b.customer_id JOIN kits k ON k.id = b.kit_id
        ${where.length ? "WHERE " + where.join(" AND ") : ""}
       ORDER BY b.delivery_date DESC, b.id DESC LIMIT 200`).bind(...args).all()).results;
@@ -167,7 +167,7 @@ async function bookingList(db, who, url, flash) {
     <form class="filters" method="get"><input name="q" value="${esc(q)}" placeholder="Name, phone, email, address"><select name="status">${opts}</select><button>Filter</button>
       <a class="button" href="/admin/bookings/new">+ New booking</a></form>
     ${rows.length ? `<table><thead><tr><th>#</th><th>Customer</th><th>Plan</th><th>Delivery</th><th>Pickup</th><th>Kit</th><th>Status</th></tr></thead><tbody>
-      ${rows.map((b) => `<tr><td><a href="/admin/bookings/${b.id}">${b.id}</a></td><td><a href="/admin/bookings/${b.id}">${esc(b.name)}</a><br><small>${esc(b.address)}</small></td>
+      ${rows.map((b) => `<tr><td><a href="/admin/bookings/${b.id}">${b.id}</a></td><td><a href="/admin/bookings/${b.id}">${esc(b.name)}</a><br><small>${esc(deliveryAddr(b))}</small></td>
         <td>${esc(b.plan)}</td><td>${esc(niceDate(b.delivery_date))}</td><td>${b.pickup_date ? esc(niceDate(b.pickup_date)) : "<em>open</em>"}</td><td>${esc(b.kit)}</td><td>${badge(b.status)}</td></tr>`).join("")}
       </tbody></table>` : `<p class="muted">No bookings found.</p>`}`, flash);
 }
@@ -185,7 +185,10 @@ async function bookingForm(db, who, v, error) {
         <label>Email <input name="email" type="email" maxlength="200" value="${esc(v.email)}"></label>
       </fieldset>
       <fieldset><legend>Delivery</legend>
-        <label>Address <input name="address" required maxlength="200" value="${esc(v.address)}"></label>
+        <label>Street address <input name="address" required maxlength="200" value="${esc(v.address)}"></label>
+        <label>Apt / unit <small>(optional)</small> <input name="address2" maxlength="50" value="${esc(v.address2)}"></label>
+        <label>City <input name="city" required maxlength="60" value="${esc(v.city)}"></label>
+        <label>State <input name="state" required maxlength="20" value="${esc(v.state)}"></label>
         <label>Zip <input name="zip" required pattern="\\d{5}" maxlength="5" value="${esc(v.zip)}"></label>
         <label>Delivery date <small>(drop-off first thing that morning)</small> <input name="delivery_date" type="date" required value="${esc(v.delivery_date)}"></label>
         <label>Pickup date <small>(blank = open-ended)</small> <input name="pickup_date" type="date" value="${esc(v.pickup_date)}"></label>
@@ -219,7 +222,7 @@ async function bookingCreate(db, who, request) {
   const s = await getSettings(db);
   const fail = (msg) => bookingForm(db, who, v, msg);
 
-  if (!v.name || !v.address || !v.zip) return fail("Name, address and zip are required.");
+  if (!v.name || !v.address || !v.city || !v.state || !v.zip) return fail("Name, street, city, state and zip are required.");
   if (!/^\d{5}$/.test(v.zip)) return fail("Zip must be 5 digits.");
   if (!["moving", "storage"].includes(v.plan)) return fail("Pick a plan.");
   if (!isDate(v.delivery_date)) return fail("Pick a delivery date.");
@@ -250,10 +253,10 @@ async function bookingCreate(db, who, request) {
   }
   const status = v.status === "pending" ? "pending" : "confirmed";
   const b = await db.prepare(
-    `INSERT INTO bookings (customer_id, kit_id, plan, status, address, zip, delivery_date, pickup_date, notes, deposit_cents, agreement_version, source,
+    `INSERT INTO bookings (customer_id, kit_id, plan, status, address, address2, city, state, zip, delivery_date, pickup_date, notes, deposit_cents, agreement_version, source,
        est_return_date, manage_token, fulfillment, addon_packs, return_method, hub)
-     VALUES (?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), ?, ?, 'admin', NULLIF(?, ''), ?, ?, ?, ?, ?) RETURNING id`)
-    .bind(customer.id, kit.id, v.plan, status, v.address, v.zip, v.delivery_date, v.pickup_date || "", v.notes || "", depositTotal, s.agreement_version || null,
+     VALUES (?, ?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), ?, ?, 'admin', NULLIF(?, ''), ?, ?, ?, ?, ?) RETURNING id`)
+    .bind(customer.id, kit.id, v.plan, status, v.address, (v.address2 || "").slice(0, 50), v.city.slice(0, 60), v.state.slice(0, 20), v.zip, v.delivery_date, v.pickup_date || "", v.notes || "", depositTotal, s.agreement_version || null,
       v.est_return_date || "", newToken(), self ? "self" : "delivery", packs, self ? "dropoff" : "pickup", self ? (HUBS[v.hub] ? v.hub : Object.keys(HUBS)[0] || null) : null).first();
   await logEvent(db, b.id, who, "created", `${v.plan}, ${kit.label}, delivery ${v.delivery_date}`);
   return redirect(`/admin/bookings/${b.id}?msg=${encodeURIComponent("Booking created.")}`);
@@ -312,9 +315,9 @@ async function bookingView(db, who, id, flash, error = "") {
       <section class="card"><h2>Details</h2><dl>
         <dt>Status</dt><dd>${badge(b.status)}</dd>
         <dt>Customer</dt><dd>${esc(b.name)}<br>${esc(b.phone || "")}${b.email ? `<br><a href="mailto:${esc(b.email)}">${esc(b.email)}</a>` : ""}</dd>
-        <dt>Address</dt><dd>${esc(b.address)}, ${esc(b.zip)}</dd>
+        <dt>Address</dt><dd>${esc(deliveryAddr(b))}</dd>
         <dt>Plan</dt><dd>${esc(b.plan)}${b.addon_packs ? ` + ${b.addon_packs * ADDON_PACK_SIZE} extra totes (${b.addon_packs} pack${b.addon_packs > 1 ? "s" : ""})` : ""}</dd>
-        <dt>Handoff</dt><dd>${b.fulfillment === "self" ? `Customer picks up at ${esc(hubName(b.hub))} hub` : "We deliver"} · return: ${b.return_method === "dropoff" ? `customer drops off at ${esc(hubName(b.hub))} hub` : `we pick up${b.pickup_address ? ` at <b>${esc(b.pickup_address)}, ${esc(b.pickup_zip || "")}</b> (new address)` : ""}`}</dd>
+        <dt>Handoff</dt><dd>${b.fulfillment === "self" ? `Customer picks up at ${esc(hubName(b.hub))} hub` : "We deliver"} · return: ${b.return_method === "dropoff" ? `customer drops off at ${esc(hubName(b.hub))} hub` : `we pick up${b.pickup_address ? ` at <b>${esc(pickupAddr(b))}</b> (new address)` : ""}`}</dd>
         <dt>Kit</dt><dd>${esc(b.kit)}${b.kit_loc ? ` <small>(kept at ${esc(hubName(b.kit_loc))})</small>` : ""}</dd>
         <dt>Delivery</dt><dd>${esc(niceDate(b.delivery_date))}, first thing in the morning</dd>
         <dt>Pickup</dt><dd>${b.pickup_date ? esc(niceDate(b.pickup_date)) : "Open-ended"}</dd>
