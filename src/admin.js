@@ -868,7 +868,7 @@ tr.today td{background:#fff8d6}tr.late td{background:#fde8e6}
 form.grid{display:grid;gap:12px}form.grid.narrow{max-width:420px}fieldset{border:1px solid var(--line);border-radius:8px;padding:12px;display:grid;gap:10px;background:var(--card)}
 label{display:grid;gap:4px;font-size:.9rem;min-width:0}input,select,textarea{font:inherit;padding:7px 9px;border:1px solid #bbb;border-radius:6px;background:#fff;width:100%}
 textarea{min-height:80px}button,.button{font:inherit;font-weight:600;padding:8px 16px;border:0;border-radius:6px;background:var(--yellow);color:var(--ink);cursor:pointer;text-decoration:none;display:inline-block;white-space:nowrap}
-form.filters,form.inline{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px}form.filters input{flex:1;min-width:200px}form.filters select,form.inline input,form.inline select{width:auto}
+form.filters,form.inline{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px}form.inline{align-items:flex-end}form.filters input{flex:1;min-width:200px}form.filters select,form.inline input,form.inline select{width:auto}
 .cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(320px,100%),1fr));gap:16px}.cols>*{min-width:0}.card{min-width:0;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:4px 16px 16px}
 dl{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:6px 14px;margin:0}dt{color:var(--muted)}dd{margin:0;min-width:0;overflow-wrap:break-word}
 label.check{display:flex;gap:8px;align-items:center}label.qty{display:flex;gap:10px;align-items:center;justify-content:space-between}label.qty input{width:80px}.owed{color:var(--red)}label.check input{width:auto}.card.complete{border:2px solid var(--yellow)}
